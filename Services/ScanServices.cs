@@ -11,6 +11,9 @@ namespace OutlookClassifierAddIn5.Services
 {
     public sealed class ScanService
     {
+        private const string PrSenderSmtpAddress = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F";
+        private const string PrInternetMessageId = "http://schemas.microsoft.com/mapi/proptag/0x1035001F";
+
         private readonly Outlook.Application _app;
         private readonly FeedbackStore _store;
 
@@ -25,12 +28,14 @@ namespace OutlookClassifierAddIn5.Services
             public int CapPerFolder { get; set; } = 400;
             public int DaysBack { get; set; } = 360;
             public int BodySamplePerFolder { get; set; } = 20; // 0 to skip body entirely
+            public int BodySnippetLength { get; set; } = 1000;
             public bool OnlyUnderInbox { get; set; } = false;   // avoid scanning non-mail stores
         }
 
         public async Task EnsureSeedTrainingDataAsync(ScanOptions opts = null, CancellationToken ct = default(CancellationToken))
         {
             if (opts == null) opts = new ScanOptions();
+            AppLogger.Info("Training scan start. DaysBack=" + opts.DaysBack + ", capPerFolder=" + opts.CapPerFolder + ".");
 
             var ns = _app.Session;
             var stores = new List<Outlook.Store>();
@@ -50,7 +55,11 @@ namespace OutlookClassifierAddIn5.Services
                     {
                         root = store.GetRootFolder();
                         start = SafeGetStartFolder(ns, store, opts.OnlyUnderInbox, root);
-                        await WalkFolderTreeAsync(start, opts, ct).ConfigureAwait(false);
+                        await WalkFolderTreeAsync(start, opts, ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLogger.Error(ex, "Store scan failed.");
                     }
                     finally
                     {
@@ -63,6 +72,7 @@ namespace OutlookClassifierAddIn5.Services
             {
                 // release the Store COM objects we added to the list
                 for (int i = 0; i < stores.Count; i++) ReleaseCom(stores[i]);
+                AppLogger.Info("Training scan end.");
             }
         }
 
@@ -74,7 +84,7 @@ namespace OutlookClassifierAddIn5.Services
                 var inbox = ns.GetDefaultFolder(Outlook.OlDefaultFolders.olFolderInbox);
                 if (inbox != null && inbox.StoreID == store.StoreID) return inbox;
             }
-            catch { }
+            catch (Exception ex) { AppLogger.Warn("Could not resolve store inbox: " + ex.Message); }
             return fallback;
         }
 
@@ -85,9 +95,9 @@ namespace OutlookClassifierAddIn5.Services
             if (!IsSkippedFolder(folder))
             {
                 bool isMailFolder = false;
-                try { isMailFolder = (folder.DefaultItemType == Outlook.OlItemType.olMailItem); } catch { }
+                try { isMailFolder = (folder.DefaultItemType == Outlook.OlItemType.olMailItem); } catch (Exception ex) { AppLogger.Warn("Could not read folder item type: " + ex.Message); }
                 if (isMailFolder)
-                    await ScanMailFolderAsync(folder, opts, ct).ConfigureAwait(false);
+                    await ScanMailFolderAsync(folder, opts, ct);
             }
 
             // Recurse into children
@@ -95,7 +105,7 @@ namespace OutlookClassifierAddIn5.Services
             {
                 try
                 {
-                    await WalkFolderTreeAsync(child, opts, ct).ConfigureAwait(false);
+                    await WalkFolderTreeAsync(child, opts, ct);
                 }
                 finally
                 {
@@ -119,15 +129,19 @@ namespace OutlookClassifierAddIn5.Services
                 table.Columns.Add("EntryID");
                 table.Columns.Add("Subject");
                 table.Columns.Add("SenderEmailAddress");
+                TryAddColumn(table, PrSenderSmtpAddress);
+                TryAddColumn(table, "ConversationID");
+                TryAddColumn(table, PrInternetMessageId);
                 table.Columns.Add("ReceivedTime");
                 // HasAttachment (MAPI tag 0x0E1B000B) — faster/safer in Table than cracking MailItem
                 table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x0E1B000B");
 
-                try { table.Sort("[ReceivedTime]", Outlook.OlSortOrder.olDescending); } catch { }
+                try { table.Sort("[ReceivedTime]", Outlook.OlSortOrder.olDescending); } catch (Exception ex) { AppLogger.Warn("Scan table sort failed: " + ex.Message); }
 
                 var batch = new List<SeedRow>(Math.Min(opts.CapPerFolder, 500));
                 int taken = 0;
                 string folderPath = SafeFolderPath(f);
+                string storeId = SafeFolderStoreId(f);
 
                 Outlook.Row row;
                 while (taken < opts.CapPerFolder && (row = table.GetNextRow()) != null)
@@ -136,15 +150,22 @@ namespace OutlookClassifierAddIn5.Services
 
                     string entryId = SafeRowString(row, "EntryID");
                     string subject = SafeRowString(row, "Subject");
-                    string sender = SafeRowString(row, "SenderEmailAddress");
+                    string senderRaw = SafeRowString(row, "SenderEmailAddress");
+                    string senderSmtp = SafeRowString(row, PrSenderSmtpAddress);
+                    string sender = SenderResolutionService.ChooseFeatureAddress(senderSmtp, senderRaw);
+                    string conversationId = SafeRowString(row, "ConversationID");
+                    string internetMessageId = SafeRowString(row, PrInternetMessageId);
                     DateTime receivedLocal = SafeRowDate(row, "ReceivedTime");
                     bool hasAtt = SafeRowBool(row, "http://schemas.microsoft.com/mapi/proptag/0x0E1B000B");
-                    string domain = ExtractDomain(sender);
+                    string domain = SenderResolutionService.ExtractDomain(sender);
                     DateTime receivedUtc = receivedLocal.ToUniversalTime();
 
                     var r = new SeedRow();
                     r.EntryId = entryId ?? string.Empty;
-                    r.FolderPath = folderPath;
+                    r.StoreId = storeId;
+                    r.InternetMessageId = internetMessageId ?? string.Empty;
+                    r.ConversationId = conversationId ?? string.Empty;
+                    r.FolderPath = FolderPathNormalizer.Normalize(folderPath);
                     r.Subject = subject ?? string.Empty;
                     r.Body = string.Empty; // fill for a sample later
                     r.Sender = sender ?? string.Empty;
@@ -157,21 +178,21 @@ namespace OutlookClassifierAddIn5.Services
 
                     if (batch.Count >= 400)
                     {
-                        await _store.UpsertEmailsAsync(batch, ct).ConfigureAwait(false);
+                        await _store.UpsertEmailsAsync(batch, ct);
                         batch.Clear();
                     }
                 }
 
                 if (batch.Count > 0)
-                    await _store.UpsertEmailsAsync(batch, ct).ConfigureAwait(false);
+                    await _store.UpsertEmailsAsync(batch, ct);
 
                 // Optional: fetch and store bodies for a small newest sample
                 if (opts.BodySamplePerFolder > 0 && taken > 0)
-                    await PopulateBodiesForSampleAsync(f, opts.BodySamplePerFolder, ct).ConfigureAwait(false);
+                    await PopulateBodiesForSampleAsync(f, opts.BodySamplePerFolder, opts.BodySnippetLength, ct);
             }
-            catch
+            catch (Exception ex)
             {
-                // swallow per-folder failures; keep going
+                AppLogger.Error(ex, "Folder scan failed: " + SafeFolderPath(f));
             }
             finally
             {
@@ -179,7 +200,7 @@ namespace OutlookClassifierAddIn5.Services
             }
         }
 
-        private async Task PopulateBodiesForSampleAsync(Outlook.MAPIFolder f, int sampleCount, CancellationToken ct)
+        private async Task PopulateBodiesForSampleAsync(Outlook.MAPIFolder f, int sampleCount, int bodySnippetLength, CancellationToken ct)
         {
             Outlook.Items items = null;
             try
@@ -196,7 +217,7 @@ namespace OutlookClassifierAddIn5.Services
                     var m = obj as Outlook.MailItem;
                     if (m == null) continue;
 
-                    string body = TrimBody(m.Body);
+                    string body = TrimBody(m.Body, bodySnippetLength);
                     toWrite.Add(new SeedBody(m.EntryID, body));
                     count++;
 
@@ -205,11 +226,11 @@ namespace OutlookClassifierAddIn5.Services
                 }
 
                 if (toWrite.Count > 0)
-                    await _store.UpsertBodiesAsync(toWrite, ct).ConfigureAwait(false);
+                    await _store.UpsertBodiesAsync(toWrite, ct);
             }
-            catch
+            catch (Exception ex)
             {
-                // ignore body failures
+                AppLogger.Error(ex, "Body sample scan failed: " + SafeFolderPath(f));
             }
             finally
             {
@@ -221,10 +242,16 @@ namespace OutlookClassifierAddIn5.Services
         {
             try
             {
-                if (!string.IsNullOrEmpty(f.FolderPath)) return f.FolderPath;
+                if (!string.IsNullOrEmpty(f.FolderPath)) return FolderPathNormalizer.Normalize(f.FolderPath);
                 return f.Name ?? string.Empty;
             }
-            catch { return f.Name ?? string.Empty; }
+            catch (Exception ex) { AppLogger.Warn("SafeFolderPath failed: " + ex.Message); return f.Name ?? string.Empty; }
+        }
+
+        private static string SafeFolderStoreId(Outlook.MAPIFolder f)
+        {
+            try { return f.StoreID ?? string.Empty; }
+            catch (Exception ex) { AppLogger.Warn("SafeFolderStoreId failed: " + ex.Message); return string.Empty; }
         }
 
         private static string SafeRowString(Outlook.Row row, string name)
@@ -262,7 +289,7 @@ namespace OutlookClassifierAddIn5.Services
         private static bool IsSkippedFolder(Outlook.MAPIFolder f)
         {
             string name = null;
-            try { name = f.Name == null ? null : f.Name.ToLowerInvariant(); } catch { }
+            try { name = f.Name == null ? null : f.Name.ToLowerInvariant(); } catch (Exception ex) { AppLogger.Warn("Could not read folder name: " + ex.Message); }
             if (string.IsNullOrEmpty(name)) return false;
 
             switch (name)
@@ -287,18 +314,11 @@ namespace OutlookClassifierAddIn5.Services
             }
         }
 
-        private static string ExtractDomain(string addr)
-        {
-            if (string.IsNullOrEmpty(addr)) return string.Empty;
-            int at = addr.IndexOf('@');
-            if (at < 0) return string.Empty;
-            return addr.Substring(at + 1).ToLowerInvariant();
-        }
-
-        private static string TrimBody(string body)
+        private static string TrimBody(string body, int maxLength)
         {
             if (string.IsNullOrEmpty(body)) return string.Empty;
-            return body.Length > 2000 ? body.Substring(0, 2000) : body;
+            if (maxLength <= 0) return string.Empty;
+            return body.Length > maxLength ? body.Substring(0, maxLength) : body;
         }
 
         private static void ReleaseCom(object o)
@@ -307,10 +327,19 @@ namespace OutlookClassifierAddIn5.Services
             try { Marshal.FinalReleaseComObject(o); } catch { }
         }
 
+        private static void TryAddColumn(Outlook.Table table, string name)
+        {
+            try { table.Columns.Add(name); }
+            catch (Exception ex) { AppLogger.Warn("Could not add scan table column " + name + ": " + ex.Message); }
+        }
+
         // DTOs (no records; C# 7.3-friendly)
         public sealed class SeedRow
         {
             public string EntryId { get; set; }
+            public string StoreId { get; set; }
+            public string InternetMessageId { get; set; }
+            public string ConversationId { get; set; }
             public string FolderPath { get; set; }
             public string Subject { get; set; }
             public string Body { get; set; }

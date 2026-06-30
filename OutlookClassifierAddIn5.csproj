@@ -38,7 +38,7 @@
     <IsWebBootstrapper>False</IsWebBootstrapper>
     <BootstrapperEnabled>true</BootstrapperEnabled>
     <BootstrapperComponentsLocation>Relative</BootstrapperComponentsLocation>
-    <PublishUrl>C:\Users\CHP7FH\Desktop\OutlookSmartSortV3\</PublishUrl>
+    <PublishUrl>publish\</PublishUrl>
     <InstallUrl />
     <TargetCulture>en</TargetCulture>
     <ApplicationVersion>1.0.0.10</ApplicationVersion>
@@ -304,10 +304,14 @@
     <Compile Include="Properties\AssemblyInfo.cs">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="Services\AppLogger.cs" />
+    <Compile Include="Services\FolderPathNormalizer.cs" />
+    <Compile Include="Services\MailFeatureDto.cs" />
+    <Compile Include="Services\OutlookMailSnapshotService.cs" />
+    <Compile Include="Services\OutlookMoveService.cs" />
     <Compile Include="Services\QueueService.cs" />
     <Compile Include="Services\ScanServices.cs" />
-    <Compile Include="Testing\SyntheticData.cs" />
-    <Compile Include="Testing\SyntheticRunner.cs" />
+    <Compile Include="Services\SenderResolutionService.cs" />
     <Compile Include="UI\Ribbon1.cs">
       <SubType>Component</SubType>
     </Compile>
@@ -336,7 +340,6 @@
       <DependentUpon>TaskPaneControl.cs</DependentUpon>
     </EmbeddedResource>
     <None Include="app.config" />
-    <None Include="OutlookClassifierAddIn5_TemporaryKey.pfx" />
     <None Include="packages.config" />
     <None Include="Properties\Settings.settings">
       <Generator>SettingsSingleFileGenerator</Generator>
@@ -363,13 +366,7 @@
     <VSToolsPath Condition="'$(VSToolsPath)' == ''">$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)</VSToolsPath>
   </PropertyGroup>
   <PropertyGroup>
-    <SignManifests>true</SignManifests>
-  </PropertyGroup>
-  <PropertyGroup>
-    <ManifestKeyFile>OutlookClassifierAddIn5_TemporaryKey.pfx</ManifestKeyFile>
-  </PropertyGroup>
-  <PropertyGroup>
-    <ManifestCertificateThumbprint>A9F4328621A9AF9E3CCEC9AAE5C2ED813AD4504B</ManifestCertificateThumbprint>
+    <SignManifests>false</SignManifests>
   </PropertyGroup>
   <!-- Include the build rules for a C# project. -->
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />

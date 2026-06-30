@@ -1,14 +1,17 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Reflection;
 using Microsoft.ML;
 using Microsoft.ML.Data;
 using Microsoft.ML.Transforms.Text;
 using Microsoft.ML.Trainers;
+using Newtonsoft.Json;
+using OutlookClassifierAddIn5.Services;
 
 namespace OutlookClassifierAddIn5.ML
 {
-    // Training/prediction row
     public sealed class EmailRow
     {
         public string Subject { get; set; }
@@ -16,12 +19,21 @@ namespace OutlookClassifierAddIn5.ML
         public string FromAddress { get; set; }
         public string SenderDomain { get; set; }
         public bool HasAttachments { get; set; }
-
-        // For training only; can be null at predict time
         public string Label { get; set; }
     }
 
-    // Predicted output schema
+    public sealed class TrainingExample
+    {
+        public string Subject { get; set; }
+        public string Body { get; set; }
+        public string FromAddress { get; set; }
+        public string SenderDomain { get; set; }
+        public bool HasAttachments { get; set; }
+        public string Label { get; set; }
+        public DateTime? ReceivedUtc { get; set; }
+        public string Source { get; set; }
+    }
+
     public sealed class Prediction
     {
         [ColumnName("PredictedLabel")]
@@ -30,75 +42,318 @@ namespace OutlookClassifierAddIn5.ML
         public float[] Score { get; set; }
     }
 
+    public sealed class ModelMetadata
+    {
+        public int ModelVersion { get; set; }
+        public string TrainedUtc { get; set; }
+        public int TrainingRows { get; set; }
+        public int LabelCount { get; set; }
+        public int BodyCap { get; set; }
+        public int RecentDays { get; set; }
+        public string AppVersion { get; set; }
+        public int FeaturePipelineVersion { get; set; }
+        public double? Top1Accuracy { get; set; }
+        public double? Top3Accuracy { get; set; }
+        public double? AccuracyAt70 { get; set; }
+        public double? AccuracyAt92 { get; set; }
+    }
+
+    public sealed class EvaluationMetrics
+    {
+        public bool Ran { get; set; }
+        public string SkipReason { get; set; }
+        public int TrainingRows { get; set; }
+        public int ValidationRows { get; set; }
+        public int LabelCount { get; set; }
+        public double Top1Accuracy { get; set; }
+        public double Top3Accuracy { get; set; }
+        public double? AccuracyAt70 { get; set; }
+        public double? AccuracyAt92 { get; set; }
+        public int CoverageAt70 { get; set; }
+        public int CoverageAt92 { get; set; }
+        public List<string> WorstConfusions { get; set; }
+        public List<string> FoldersWithTooFewExamples { get; set; }
+
+        public EvaluationMetrics()
+        {
+            WorstConfusions = new List<string>();
+            FoldersWithTooFewExamples = new List<string>();
+        }
+    }
+
+    public sealed class TrainingResult
+    {
+        public int TrainingRows { get; set; }
+        public int LabelCount { get; set; }
+        public ModelMetadata Metadata { get; set; }
+        public EvaluationMetrics Evaluation { get; set; }
+
+        public string ToStatusSummary()
+        {
+            if (Evaluation != null && Evaluation.Ran)
+            {
+                return string.Format(
+                    "Training complete: {0} rows, {1} folders, top-3 accuracy {2:P1}",
+                    TrainingRows,
+                    LabelCount,
+                    Evaluation.Top3Accuracy);
+            }
+
+            return string.Format("Training complete: {0} rows, {1} folders", TrainingRows, LabelCount);
+        }
+    }
+
     public class ModelService
     {
+        public const int ModelVersion = 1;
+        public const int FeaturePipelineVersion = 1;
+        public const int BodyCap = 1000;
+        public const int DefaultRecentDays = 180;
+
         private readonly MLContext _ml = new MLContext(0);
         private ITransformer _model;
         private DataViewSchema _schema;
-
-        // Cached single-row engine (for interactive UI) + class names cache
         private PredictionEngine<EmailRow, Prediction> _engine;
         private string[] _classNames;
         private readonly object _predictLock = new object();
 
-        /// <summary>
-        /// Train (or retrain) the multiclass model from in-memory rows.
-        /// Applies data hygiene, caps body length, class-balanced sampling,
-        /// and uses a balanced, fast feature set.
-        /// </summary>
+        public ModelMetadata LastMetadata { get; private set; }
+        public TrainingResult LastTrainingResult { get; private set; }
+
+        public bool IsLoaded
+        {
+            get { return _model != null; }
+        }
+
+        public string ModelSignature
+        {
+            get
+            {
+                var meta = LastMetadata;
+                if (meta == null) return IsLoaded ? "loaded-without-metadata" : "none";
+                return meta.ModelVersion + ":" + meta.FeaturePipelineVersion + ":" + meta.TrainedUtc + ":" + meta.TrainingRows + ":" + meta.LabelCount;
+            }
+        }
+
         public void Train(IEnumerable<EmailRow> rows, out DataViewSchema schema)
         {
             if (rows == null) throw new ArgumentNullException(nameof(rows));
 
-            // 1) Sanitize + defensive copies
-            var list = rows.Select(r => new EmailRow
+            var examples = rows.Select(r => new TrainingExample
             {
-                Subject = r.Subject ?? string.Empty,
-                Body = r.Body ?? string.Empty,
-                FromAddress = r.FromAddress ?? string.Empty,
-                SenderDomain = r.SenderDomain ?? string.Empty,
+                Subject = r.Subject,
+                Body = r.Body,
+                FromAddress = r.FromAddress,
+                SenderDomain = r.SenderDomain,
                 HasAttachments = r.HasAttachments,
-                Label = string.IsNullOrWhiteSpace(r.Label) ? null : r.Label
-            })
-            .Where(r => !string.IsNullOrWhiteSpace(r.Label))
-            .ToList();
+                Label = r.Label
+            }).ToList();
 
-            // 2) Guard: never learn to "file to Inbox" (root inbox only)
-            list = list.Where(r => !IsInboxPath(r.Label)).ToList();
+            TrainWithEvaluation(examples, DefaultRecentDays, out schema);
+        }
 
-            // 3) Cap body length to reduce featurization cost
-            const int BodyCap = 1000;
-            for (int i = 0; i < list.Count; i++)
+        public TrainingResult TrainWithEvaluation(IEnumerable<TrainingExample> examples, int recentDays, out DataViewSchema schema)
+        {
+            if (examples == null) throw new ArgumentNullException(nameof(examples));
+
+            var prepared = PrepareExamples(examples);
+            var rows = prepared.Select(p => p.Row).ToList();
+            var labelCount = rows.Select(r => r.Label).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+
+            if (labelCount < 2)
+                throw new InvalidOperationException("Model training requires at least two different folders after cleanup.");
+
+            AppLogger.Info("Model train start. Rows=" + rows.Count + ", labels=" + labelCount + ".");
+
+            var evaluation = EvaluateIfPossible(prepared);
+
+            var data = _ml.Data.LoadFromEnumerable(rows);
+            var pipeline = BuildPipeline();
+
+            try
             {
-                var b = list[i].Body;
-                if (!string.IsNullOrEmpty(b) && b.Length > BodyCap)
-                    list[i].Body = b.Substring(0, BodyCap);
+                _model = pipeline.Fit(data);
+                _schema = data.Schema;
+                schema = _schema;
+                BuildEngineAndClassNames();
+
+                LastMetadata = new ModelMetadata
+                {
+                    ModelVersion = ModelVersion,
+                    TrainedUtc = DateTime.UtcNow.ToString("o"),
+                    TrainingRows = rows.Count,
+                    LabelCount = labelCount,
+                    BodyCap = BodyCap,
+                    RecentDays = recentDays,
+                    AppVersion = GetAppVersion(),
+                    FeaturePipelineVersion = FeaturePipelineVersion,
+                    Top1Accuracy = evaluation != null && evaluation.Ran ? (double?)evaluation.Top1Accuracy : null,
+                    Top3Accuracy = evaluation != null && evaluation.Ran ? (double?)evaluation.Top3Accuracy : null,
+                    AccuracyAt70 = evaluation == null ? null : evaluation.AccuracyAt70,
+                    AccuracyAt92 = evaluation == null ? null : evaluation.AccuracyAt92
+                };
+
+                LastTrainingResult = new TrainingResult
+                {
+                    TrainingRows = rows.Count,
+                    LabelCount = labelCount,
+                    Metadata = LastMetadata,
+                    Evaluation = evaluation
+                };
+
+                LogEvaluation(evaluation);
+                AppLogger.Info("Model train end. " + LastTrainingResult.ToStatusSummary());
+
+                return LastTrainingResult;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error(ex, "ML.NET training failed.");
+                throw;
+            }
+        }
+
+        public (string folder, List<(string name, float p)> top3, float conf) PredictTop3(EmailRow row)
+        {
+            if (_model == null) throw new InvalidOperationException("Model not trained");
+            if (_engine == null || _classNames == null) BuildEngineAndClassNames();
+
+            Prediction pred;
+            lock (_predictLock)
+            {
+                pred = _engine.Predict(SanitizePredictionRow(row));
             }
 
-            // 4) Drop labels with < 2 examples to avoid degenerate classes
-            var labelCounts = list.GroupBy(r => r.Label)
-                                  .ToDictionary(g => g.Key, g => g.Count());
-            list = list.Where(r => labelCounts[r.Label] >= 2).ToList();
+            var ranked = RankScores(pred.Score).Take(3).ToList();
+            return (pred.Folder, ranked, ranked.Count > 0 ? ranked[0].p : 0f);
+        }
 
-            // 5) Class-balanced sampling: keep at most N examples per label (newest-first assumed)
-            list = ClassBalancedSample(list, perLabelCap: 2000);
+        public IEnumerable<(string folder, List<(string name, float p)> top3, float conf)>
+            PredictBatch(IEnumerable<EmailRow> rows)
+        {
+            if (_model == null) throw new InvalidOperationException("Model not trained");
+            if (rows == null) yield break;
+            if (_engine == null || _classNames == null) BuildEngineAndClassNames();
 
-            var distinctLabels = list.GroupBy(r => r.Label).Count();
-            if (distinctLabels < 2)
+            var sanitized = rows.Select(SanitizePredictionRow).ToList();
+            var dv = _ml.Data.LoadFromEnumerable(sanitized);
+            var scored = _model.Transform(dv);
+
+            var pred = scored.GetColumn<string>("PredictedLabel").ToArray();
+            var scores = scored.GetColumn<VBuffer<float>>("Score").ToArray();
+
+            for (int i = 0; i < scores.Length; i++)
             {
-                System.Windows.Forms.MessageBox.Show(
-                    "Model training requires at least two different folders (labels) after cleanup.\n" +
-                    "Try broadening the training window or confirming folder names.",
-                    "Not enough training data");
-                throw new InvalidOperationException("Insufficient label diversity for training.");
+                var dense = scores[i].DenseValues().ToArray();
+                var ranked = RankScores(dense).Take(3).ToList();
+                yield return (pred[i], ranked, ranked.Count > 0 ? ranked[0].p : 0f);
+            }
+        }
+
+        public void Save(string path)
+        {
+            if (_model == null) throw new InvalidOperationException("Model not trained");
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+
+            _ml.Model.Save(_model, _schema, path);
+
+            var metadata = LastMetadata ?? new ModelMetadata
+            {
+                ModelVersion = ModelVersion,
+                TrainedUtc = DateTime.UtcNow.ToString("o"),
+                TrainingRows = 0,
+                LabelCount = 0,
+                BodyCap = BodyCap,
+                RecentDays = DefaultRecentDays,
+                AppVersion = GetAppVersion(),
+                FeaturePipelineVersion = FeaturePipelineVersion
+            };
+
+            File.WriteAllText(GetMetadataPath(path), JsonConvert.SerializeObject(metadata, Formatting.Indented));
+            AppLogger.Info("Model saved: " + path);
+        }
+
+        public void Load(string path)
+        {
+            if (!TryLoad(path))
+                throw new InvalidOperationException("Model could not be loaded.");
+        }
+
+        public bool TryLoad(string path)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                    return false;
+
+                var metadataPath = GetMetadataPath(path);
+                ModelMetadata metadata = null;
+                if (File.Exists(metadataPath))
+                {
+                    metadata = JsonConvert.DeserializeObject<ModelMetadata>(File.ReadAllText(metadataPath));
+                    if (!IsMetadataCompatible(metadata))
+                    {
+                        AppLogger.Warn("Model metadata is incompatible. Model will not be loaded.");
+                        return false;
+                    }
+                }
+                else
+                {
+                    AppLogger.Warn("Model metadata is missing. Loading model for compatibility, but automation remains disabled.");
+                }
+
+                _model = _ml.Model.Load(path, out _schema);
+                LastMetadata = metadata;
+                BuildEngineAndClassNames();
+                AppLogger.Info("Model load success: " + path);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error(ex, "Model load failed.");
+                return false;
+            }
+        }
+
+        public bool CanAutoApprove(double threshold, out string reason)
+        {
+            reason = string.Empty;
+
+            if (!IsLoaded)
+            {
+                reason = "No model is loaded.";
+                return false;
             }
 
-            // 6) IDataView
-            var data = _ml.Data.LoadFromEnumerable(list);
+            if (LastMetadata == null)
+            {
+                reason = "The loaded model has no metadata or evaluation.";
+                return false;
+            }
 
-            // 7) Build balanced, fixed-size text features (version-safe explicit pipeline)
+            if (!LastMetadata.Top3Accuracy.HasValue || !LastMetadata.AccuracyAt92.HasValue)
+            {
+                reason = "Auto-approve requires post-training evaluation metrics.";
+                return false;
+            }
 
-            // SUBJECT: words (uni+bi, keep numbers) + tiny char 3-grams (dictionary-based)
+            if (LastMetadata.Top3Accuracy.Value < 0.80)
+            {
+                reason = "Top-3 validation accuracy is below 80%.";
+                return false;
+            }
+
+            if (threshold >= 0.92 && LastMetadata.AccuracyAt92.Value < 0.90)
+            {
+                reason = "High-confidence validation accuracy is below 90%.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private IEstimator<ITransformer> BuildPipeline()
+        {
             var subjectPipe =
                 _ml.Transforms.Text.NormalizeText(
                         outputColumnName: "s_norm",
@@ -113,21 +368,20 @@ namespace OutlookClassifierAddIn5.ML
                   .Append(_ml.Transforms.Text.ProduceHashedWordBags(
                         outputColumnName: "fSubject",
                         inputColumnName: "s_tok",
-                        ngramLength: 2,           // uni+bi
+                        ngramLength: 2,
                         useAllLengths: true,
-                        numberOfBits: 16))        // 65,536 dims (hashed)
+                        numberOfBits: 16))
                   .Append(_ml.Transforms.Text.TokenizeIntoCharactersAsKeys(
                         outputColumnName: "s_chars",
                         inputColumnName: "s_norm"))
-                  .Append(_ml.Transforms.Text.ProduceNgrams(           // <-- portable alt to ProduceHashedNGrams
+                  .Append(_ml.Transforms.Text.ProduceNgrams(
                         outputColumnName: "fSubjectChar",
                         inputColumnName: "s_chars",
                         ngramLength: 3,
                         useAllLengths: false,
-                        maximumNgramsCount: 16000,                       // cap dictionary size
+                        maximumNgramsCount: 16000,
                         weighting: NgramExtractingEstimator.WeightingCriteria.Tf));
 
-            // FROM: words (uni+bi, keep numbers) + tiny char 3-grams (dictionary-based)
             var fromPipe =
                 _ml.Transforms.Text.NormalizeText(
                         outputColumnName: "fa_norm",
@@ -144,7 +398,7 @@ namespace OutlookClassifierAddIn5.ML
                         inputColumnName: "fa_tok",
                         ngramLength: 2,
                         useAllLengths: true,
-                        numberOfBits: 15))        // 32,768 dims (hashed)
+                        numberOfBits: 15))
                   .Append(_ml.Transforms.Text.TokenizeIntoCharactersAsKeys(
                         outputColumnName: "fa_chars",
                         inputColumnName: "fa_norm"))
@@ -156,7 +410,6 @@ namespace OutlookClassifierAddIn5.ML
                         maximumNgramsCount: 16000,
                         weighting: NgramExtractingEstimator.WeightingCriteria.Tf));
 
-            // BODY: words (unigrams only), trimmed, no char grams
             var bodyPipe =
                 _ml.Transforms.Text.NormalizeText(
                         outputColumnName: "b_norm",
@@ -175,16 +428,13 @@ namespace OutlookClassifierAddIn5.ML
                         useAllLengths: true,
                         numberOfBits: 16));
 
-            // 8) Trainer with bounded iterations for predictable runtime
             var sdca = _ml.MulticlassClassification.Trainers.SdcaMaximumEntropy(
                 new SdcaMaximumEntropyMulticlassTrainer.Options
                 {
-                    MaximumNumberOfIterations = 100, // balanced speed/accuracy
-                    // L2Regularization = 1e-4f,     // optional: small L2 can help generalization
+                    MaximumNumberOfIterations = 100
                 });
 
-            var pipeline =
-                subjectPipe
+            return subjectPipe
                 .Append(bodyPipe)
                 .Append(fromPipe)
                 .Append(_ml.Transforms.Categorical.OneHotHashEncoding("fDomain", nameof(EmailRow.SenderDomain)))
@@ -198,121 +448,218 @@ namespace OutlookClassifierAddIn5.ML
                 .AppendCacheCheckpoint(_ml)
                 .Append(sdca)
                 .Append(_ml.Transforms.Conversion.MapKeyToValue("PredictedLabel"));
+        }
 
-            // 9) Fit
+        private List<PreparedTrainingExample> PrepareExamples(IEnumerable<TrainingExample> examples)
+        {
+            var list = examples.Select(r =>
+            {
+                var from = r.FromAddress ?? string.Empty;
+                var domain = string.IsNullOrWhiteSpace(r.SenderDomain)
+                    ? SenderResolutionService.ExtractDomain(from)
+                    : r.SenderDomain;
+
+                var body = r.Body ?? string.Empty;
+                if (body.Length > BodyCap) body = body.Substring(0, BodyCap);
+
+                return new PreparedTrainingExample
+                {
+                    Row = new EmailRow
+                    {
+                        Subject = r.Subject ?? string.Empty,
+                        Body = body,
+                        FromAddress = from,
+                        SenderDomain = domain,
+                        HasAttachments = r.HasAttachments,
+                        Label = FolderPathNormalizer.Normalize(r.Label)
+                    },
+                    ReceivedUtc = r.ReceivedUtc,
+                    Source = r.Source ?? string.Empty
+                };
+            })
+            .Where(r => !string.IsNullOrWhiteSpace(r.Row.Label))
+            .Where(r => !FolderPathNormalizer.IsExcludedSystemFolder(r.Row.Label))
+            .ToList();
+
+            var counts = list.GroupBy(r => r.Row.Label, StringComparer.OrdinalIgnoreCase)
+                             .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
+
+            list = list.Where(r => counts[r.Row.Label] >= 2).ToList();
+            return ClassBalancedSample(list, 2000);
+        }
+
+        private EvaluationMetrics EvaluateIfPossible(List<PreparedTrainingExample> prepared)
+        {
+            var metrics = new EvaluationMetrics();
+            var labelCounts = prepared.GroupBy(r => r.Row.Label, StringComparer.OrdinalIgnoreCase)
+                                      .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
+
+            metrics.FoldersWithTooFewExamples = labelCounts
+                .Where(kv => kv.Value < 5)
+                .OrderBy(kv => kv.Value)
+                .Take(10)
+                .Select(kv => kv.Key + " (" + kv.Value + ")")
+                .ToList();
+
+            if (prepared.Count < 50)
+            {
+                metrics.SkipReason = "Not enough rows for holdout evaluation.";
+                return metrics;
+            }
+
+            var labels = prepared.Select(r => r.Row.Label).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+            if (labels < 2)
+            {
+                metrics.SkipReason = "Not enough labels for holdout evaluation.";
+                return metrics;
+            }
+
+            var withDates = prepared.Count(r => r.ReceivedUtc.HasValue);
+            var ordered = withDates >= prepared.Count / 2
+                ? prepared.OrderBy(r => r.ReceivedUtc.HasValue ? r.ReceivedUtc.Value : DateTime.MinValue).ToList()
+                : prepared.ToList();
+
+            var validationCount = Math.Max(10, (int)Math.Round(ordered.Count * 0.20));
+            if (ordered.Count - validationCount < 20)
+            {
+                metrics.SkipReason = "Not enough training rows after holdout split.";
+                return metrics;
+            }
+
+            var train = ordered.Take(ordered.Count - validationCount).ToList();
+            var validation = ordered.Skip(ordered.Count - validationCount).ToList();
+            var trainLabels = new HashSet<string>(train.Select(r => r.Row.Label), StringComparer.OrdinalIgnoreCase);
+            validation = validation.Where(r => trainLabels.Contains(r.Row.Label)).ToList();
+
+            if (validation.Count < 10 || trainLabels.Count < 2)
+            {
+                metrics.SkipReason = "Holdout labels were not represented in training split.";
+                return metrics;
+            }
+
             try
             {
-                _model = pipeline.Fit(data);
-                _schema = data.Schema;
-                schema = _schema;
+                var trainData = _ml.Data.LoadFromEnumerable(train.Select(r => r.Row));
+                var validationRows = validation.Select(r => r.Row).ToList();
+                var validationData = _ml.Data.LoadFromEnumerable(validationRows);
+                var model = BuildPipeline().Fit(trainData);
+                var scored = model.Transform(validationData);
 
-                // Reset caches for prediction
-                BuildEngineAndClassNames();
+                var predicted = scored.GetColumn<string>("PredictedLabel").ToArray();
+                var scores = scored.GetColumn<VBuffer<float>>("Score").ToArray();
+                var classNames = GetClassNames(scored.Schema);
+
+                int top1 = 0;
+                int top3 = 0;
+                int at70 = 0;
+                int ok70 = 0;
+                int at92 = 0;
+                int ok92 = 0;
+                var confusions = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                for (var i = 0; i < validationRows.Count; i++)
+                {
+                    var truth = validationRows[i].Label;
+                    var pred = predicted[i];
+                    var dense = scores[i].DenseValues().ToArray();
+                    var ranked = dense
+                        .Select((score, idx) => new { Name = idx < classNames.Length ? classNames[idx] : string.Empty, Score = score })
+                        .OrderByDescending(x => x.Score)
+                        .Take(3)
+                        .ToList();
+
+                    var conf = ranked.Count == 0 ? 0f : ranked[0].Score;
+
+                    if (string.Equals(truth, pred, StringComparison.OrdinalIgnoreCase))
+                    {
+                        top1++;
+                    }
+                    else
+                    {
+                        var key = truth + " -> " + pred;
+                        int count;
+                        confusions[key] = confusions.TryGetValue(key, out count) ? count + 1 : 1;
+                    }
+
+                    if (ranked.Any(x => string.Equals(x.Name, truth, StringComparison.OrdinalIgnoreCase)))
+                        top3++;
+
+                    if (conf >= 0.70f)
+                    {
+                        at70++;
+                        if (string.Equals(truth, pred, StringComparison.OrdinalIgnoreCase)) ok70++;
+                    }
+
+                    if (conf >= 0.92f)
+                    {
+                        at92++;
+                        if (string.Equals(truth, pred, StringComparison.OrdinalIgnoreCase)) ok92++;
+                    }
+                }
+
+                metrics.Ran = true;
+                metrics.TrainingRows = train.Count;
+                metrics.ValidationRows = validationRows.Count;
+                metrics.LabelCount = trainLabels.Count;
+                metrics.Top1Accuracy = top1 / (double)validationRows.Count;
+                metrics.Top3Accuracy = top3 / (double)validationRows.Count;
+                metrics.CoverageAt70 = at70;
+                metrics.CoverageAt92 = at92;
+                metrics.AccuracyAt70 = at70 > 0 ? (double?)ok70 / at70 : null;
+                metrics.AccuracyAt92 = at92 > 0 ? (double?)ok92 / at92 : null;
+                metrics.WorstConfusions = confusions
+                    .OrderByDescending(kv => kv.Value)
+                    .Take(5)
+                    .Select(kv => kv.Key + " (" + kv.Value + ")")
+                    .ToList();
             }
             catch (Exception ex)
             {
-                var root = ex;
-                while (root.InnerException != null) root = root.InnerException;
-
-                System.Windows.Forms.MessageBox.Show(
-                    "ML.NET training failed:\n\n" + root.Message + "\n\n" + root.StackTrace,
-                    "Training error");
-                throw;
+                metrics.Ran = false;
+                metrics.SkipReason = "Evaluation failed: " + ex.Message;
+                AppLogger.Error(ex, "Post-training evaluation failed.");
             }
+
+            return metrics;
         }
 
-        /// <summary>
-        /// Single-item prediction for interactive UI.
-        /// Returns (folder, top3 (name, prob), top1 probability).
-        /// </summary>
-        public (string folder, List<(string name, float p)> top3, float conf) PredictTop3(EmailRow row)
+        private List<(string name, float p)> RankScores(float[] scores)
         {
-            if (_model == null) throw new InvalidOperationException("Model not trained");
-            if (_engine == null || _classNames == null) BuildEngineAndClassNames();
-
-            Prediction pred;
-            lock (_predictLock)
-            {
-                pred = _engine.Predict(row);
-            }
-
-            var ranked = pred.Score
-                .Select((p, i) => Tuple.Create(_classNames[i], p))
-                .OrderByDescending(t => t.Item2)
-                .Take(3)
-                .Select(t => (t.Item1, t.Item2))
+            if (scores == null) return new List<(string name, float p)>();
+            return scores
+                .Select((p, i) => (name: _classNames != null && i < _classNames.Length ? _classNames[i] : string.Empty, p: p))
+                .OrderByDescending(t => t.p)
                 .ToList();
-
-            return (pred.Folder, ranked, ranked.Count > 0 ? ranked[0].Item2 : 0f);
         }
 
-        /// <summary>
-        /// High-throughput batch prediction for queue building.
-        /// </summary>
-        public IEnumerable<(string folder, List<(string name, float p)> top3, float conf)>
-            PredictBatch(IEnumerable<EmailRow> rows)
+        private static EmailRow SanitizePredictionRow(EmailRow row)
         {
-            if (_model == null) throw new InvalidOperationException("Model not trained");
-            if (rows == null) yield break;
+            row = row ?? new EmailRow();
+            var body = row.Body ?? string.Empty;
+            if (body.Length > BodyCap) body = body.Substring(0, BodyCap);
+            var from = row.FromAddress ?? string.Empty;
 
-            if (_engine == null || _classNames == null) BuildEngineAndClassNames();
-
-            var dv = _ml.Data.LoadFromEnumerable(rows);
-            var scored = _model.Transform(dv);
-
-            var pred = scored.GetColumn<string>("PredictedLabel").ToArray();
-            var scores = scored.GetColumn<VBuffer<float>>("Score").ToArray();
-
-            for (int i = 0; i < scores.Length; i++)
+            return new EmailRow
             {
-                var dense = scores[i].DenseValues().ToArray();
-                var ranked = dense
-                    .Select((p, idx) => new { Name = _classNames[idx], P = p })
-                    .OrderByDescending(x => x.P)
-                    .Take(3)
-                    .Select(x => (x.Name, x.P))
-                    .ToList();
-
-                yield return (pred[i], ranked, ranked.Count > 0 ? ranked[0].P : 0f);
-            }
+                Subject = row.Subject ?? string.Empty,
+                Body = body,
+                FromAddress = from,
+                SenderDomain = string.IsNullOrWhiteSpace(row.SenderDomain) ? SenderResolutionService.ExtractDomain(from) : row.SenderDomain,
+                HasAttachments = row.HasAttachments,
+                Label = row.Label ?? string.Empty
+            };
         }
 
-        public void Save(string path)
-        {
-            if (_model == null) throw new InvalidOperationException("Model not trained");
-            _ml.Model.Save(_model, _schema, path);
-        }
-
-        public void Load(string path)
-        {
-            _model = _ml.Model.Load(path, out _schema);
-            BuildEngineAndClassNames();
-        }
-
-        // ----------------------- helpers -----------------------
-
-        private static bool IsInboxPath(string path)
-        {
-            if (string.IsNullOrEmpty(path)) return false;
-            var s = path.Replace('\\', '/').Trim().Trim('/').ToLowerInvariant();
-            return s == "inbox" || s.EndsWith("/inbox");
-        }
-
-        /// <summary>
-        /// Keep at most perLabelCap rows per label, in input order.
-        /// Assumes input is roughly newest-first (as provided by the DB).
-        /// </summary>
-        private static List<EmailRow> ClassBalancedSample(IEnumerable<EmailRow> src, int perLabelCap)
+        private static List<PreparedTrainingExample> ClassBalancedSample(IEnumerable<PreparedTrainingExample> src, int perLabelCap)
         {
             var caps = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var keep = new List<EmailRow>();
+            var keep = new List<PreparedTrainingExample>();
             foreach (var r in src)
             {
-                if (string.IsNullOrWhiteSpace(r.Label)) continue;
                 int used;
-                if (!caps.TryGetValue(r.Label, out used)) used = 0;
+                if (!caps.TryGetValue(r.Row.Label, out used)) used = 0;
                 if (used >= perLabelCap) continue;
-                caps[r.Label] = used + 1;
+                caps[r.Row.Label] = used + 1;
                 keep.Add(r);
             }
             return keep;
@@ -324,16 +671,76 @@ namespace OutlookClassifierAddIn5.ML
 
             if (_engine != null)
             {
-                try { _engine.Dispose(); } catch { }
+                try { _engine.Dispose(); } catch (Exception ex) { AppLogger.Warn("Prediction engine dispose failed: " + ex.Message); }
                 _engine = null;
             }
 
             _engine = _ml.Model.CreatePredictionEngine<EmailRow, Prediction>(_model);
+            _classNames = GetClassNames(_engine.OutputSchema);
+        }
 
-            // Cache class names (Score slot names)
+        private static string[] GetClassNames(DataViewSchema schema)
+        {
             var slot = default(VBuffer<ReadOnlyMemory<char>>);
-            _engine.OutputSchema[nameof(Prediction.Score)].GetSlotNames(ref slot);
-            _classNames = slot.DenseValues().Select(s => s.ToString()).ToArray();
+            schema[nameof(Prediction.Score)].GetSlotNames(ref slot);
+            return slot.DenseValues().Select(s => s.ToString()).ToArray();
+        }
+
+        private static bool IsMetadataCompatible(ModelMetadata metadata)
+        {
+            if (metadata == null) return false;
+            return metadata.ModelVersion == ModelVersion
+                && metadata.FeaturePipelineVersion == FeaturePipelineVersion
+                && metadata.BodyCap == BodyCap;
+        }
+
+        private static string GetMetadataPath(string modelPath)
+        {
+            return Path.ChangeExtension(modelPath, ".meta.json");
+        }
+
+        private static string GetAppVersion()
+        {
+            var version = Assembly.GetExecutingAssembly().GetName().Version;
+            return version == null ? "1.0.0" : version.ToString();
+        }
+
+        private static void LogEvaluation(EvaluationMetrics evaluation)
+        {
+            if (evaluation == null)
+            {
+                AppLogger.Warn("No evaluation metrics produced.");
+                return;
+            }
+
+            if (!evaluation.Ran)
+            {
+                AppLogger.Warn("Training evaluation skipped: " + evaluation.SkipReason);
+                return;
+            }
+
+            AppLogger.Info(string.Format(
+                "Evaluation: train={0}, validate={1}, labels={2}, top1={3:P2}, top3={4:P2}, acc>=0.70={5}, acc>=0.92={6}.",
+                evaluation.TrainingRows,
+                evaluation.ValidationRows,
+                evaluation.LabelCount,
+                evaluation.Top1Accuracy,
+                evaluation.Top3Accuracy,
+                evaluation.AccuracyAt70.HasValue ? evaluation.AccuracyAt70.Value.ToString("P2") : "n/a",
+                evaluation.AccuracyAt92.HasValue ? evaluation.AccuracyAt92.Value.ToString("P2") : "n/a"));
+
+            if (evaluation.WorstConfusions.Count > 0)
+                AppLogger.Info("Worst confused folders: " + string.Join("; ", evaluation.WorstConfusions.ToArray()));
+
+            if (evaluation.FoldersWithTooFewExamples.Count > 0)
+                AppLogger.Info("Folders with few examples: " + string.Join("; ", evaluation.FoldersWithTooFewExamples.ToArray()));
+        }
+
+        private sealed class PreparedTrainingExample
+        {
+            public EmailRow Row { get; set; }
+            public DateTime? ReceivedUtc { get; set; }
+            public string Source { get; set; }
         }
     }
 }

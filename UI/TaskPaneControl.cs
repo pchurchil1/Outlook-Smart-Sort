@@ -38,6 +38,7 @@ namespace OutlookClassifierAddIn5.UI
         private readonly FeedbackStore _store;
         private readonly QueueService _queue;
         private readonly string _modelPath; // ADD THIS LINE
+        private readonly OutlookMoveService _moveService;
 
         // UI
         private TabControl tabs;
@@ -94,7 +95,34 @@ namespace OutlookClassifierAddIn5.UI
         private readonly Dictionary<string, string> _prettyFromCache =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        public void SetAutoApprove(bool on) { _autoApproveEnabled = on; }
+        public bool SetAutoApprove(bool on)
+        {
+            if (!on)
+            {
+                _autoApproveEnabled = false;
+                AppLogger.Info("Auto-approve disabled.");
+                return false;
+            }
+
+            string reason;
+            if (!_ml.CanAutoApprove(_autoApproveThreshold, out reason))
+            {
+                _autoApproveEnabled = false;
+                MessageBox.Show("Auto-approve is disabled until a compatible model has strong validation metrics.\n\n" + reason, "Auto-Approve");
+                AppLogger.Warn("Auto-approve enable blocked: " + reason);
+                return false;
+            }
+
+            var confirm = MessageBox.Show(
+                "Auto-approve will automatically move high-confidence email suggestions. You can still use Undo for recent moves.",
+                "Enable Auto-Approve?",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+
+            _autoApproveEnabled = confirm == DialogResult.Yes;
+            AppLogger.Warn(_autoApproveEnabled ? "Auto-approve enabled by user." : "Auto-approve enable cancelled by user.");
+            return _autoApproveEnabled;
+        }
         
         // optional if we later want to tweak the threshold from UI:
         // public void SetAutoApproveThreshold(double t) { _autoApproveThreshold = t; }
@@ -105,6 +133,7 @@ namespace OutlookClassifierAddIn5.UI
             _store = store;
             _queue = queue;
             _modelPath = modelPath; 
+            _moveService = new OutlookMoveService(app, ModelService.BodyCap);
 
             InitializeComponent();
             BuildUi();
@@ -126,9 +155,6 @@ namespace OutlookClassifierAddIn5.UI
             RefreshFolderList();
             RebindGridFromBatchItems();
             UpdateBatchCountsUi();
-
-            // ⬇️ Build queues, then refresh Batch UI
-            _ = BuildQueuesAndRefreshAsync();
 
             // clear single view
             ClearSingleView("Select an email");
@@ -361,8 +387,16 @@ namespace OutlookClassifierAddIn5.UI
         private void UI(Action a)
         {
             if (this.IsDisposed) return;
-            if (this.InvokeRequired) { try { this.BeginInvoke(a); } catch { } }
-            else { try { a(); } catch { } }
+            if (this.InvokeRequired) { try { this.BeginInvoke(a); } catch (Exception ex) { AppLogger.Warn("UI dispatch failed: " + ex.Message); } }
+            else { try { a(); } catch (Exception ex) { AppLogger.Error(ex, "UI action failed."); } }
+        }
+
+        public void SetStatus(string message)
+        {
+            UI(() =>
+            {
+                if (lblStats != null) lblStats.Text = message ?? string.Empty;
+            });
         }
 
         private void AdjustBatchSplitter()
@@ -376,7 +410,7 @@ namespace OutlookClassifierAddIn5.UI
                 int max = Math.Max(min, batchSplit.Width - batchSplit.Panel2MinSize - 50);
                 batchSplit.SplitterDistance = Math.Min(Math.Max(target, min), max);
             }
-            catch { /* ignore sizing exceptions */ }
+            catch (Exception ex) { AppLogger.Warn("Batch splitter sizing failed: " + ex.Message); }
         }
 
         private void ConfigureSplitSafely()
@@ -413,8 +447,9 @@ namespace OutlookClassifierAddIn5.UI
                 batchSplit.Panel1MinSize = min1;
                 batchSplit.Panel2MinSize = min2;
             }
-            catch
+            catch (Exception ex)
             {
+                AppLogger.Warn("Batch splitter min-size adjustment failed: " + ex.Message);
                 // If a race hits here, relax to zero mins
                 batchSplit.Panel1MinSize = 0;
                 batchSplit.Panel2MinSize = 0;
@@ -427,7 +462,7 @@ namespace OutlookClassifierAddIn5.UI
 
             if (clamped >= min1 && clamped <= maxLeft)
             {
-                try { batchSplit.SplitterDistance = clamped; } catch { /* ignore layout races */ }
+                try { batchSplit.SplitterDistance = clamped; } catch (Exception ex) { AppLogger.Warn("Batch splitter distance adjustment failed: " + ex.Message); }
             }
         }
         // ========= THEME / COLORS =========
@@ -496,12 +531,13 @@ namespace OutlookClassifierAddIn5.UI
                     {
                         var ns = _app.Session;
                         var folder = FolderMap.ResolveFolderByPath(p, ns);
-                        if (folder != null && seen.Add(p)) // Only add if folder actually exists and not already added
-                            _mailFolderPathsFull.Add(p);
+                        var normalized = FolderPathNormalizer.Normalize(p);
+                        if (folder != null && seen.Add(normalized)) // Only add if folder actually exists and not already added
+                            _mailFolderPathsFull.Add(normalized);
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Skip folders that can't be resolved (deleted/moved folders)
+                        AppLogger.Warn("Folder skipped during refresh because it could not be resolved: " + p + " " + ex.Message);
                     }
                 }
             }
@@ -703,16 +739,21 @@ namespace OutlookClassifierAddIn5.UI
                     return;
                 }
 
-                string body = mail.Body ?? string.Empty;
-                if (body.Length > 2000) body = body.Substring(0, 2000);
-                var smtp = GetSenderSmtpAddress(mail);
+                var snapshot = OutlookMailSnapshotService.CreateSnapshot(mail, ModelService.BodyCap);
+                if (snapshot == null)
+                {
+                    ClearSingleView("Select an email");
+                    return;
+                }
+
+                var smtp = snapshot.FromAddress ?? string.Empty;
                 var row = new EmailRow
                 {
-                    Subject = mail.Subject ?? string.Empty,
-                    Body = body,
-                    FromAddress = mail.SenderEmailAddress ?? string.Empty,        // raw, as training had it
-                    SenderDomain = ExtractDomain(mail.SenderEmailAddress ?? ""),  // derive from same string
-                    HasAttachments = (mail.Attachments != null && mail.Attachments.Count > 0),
+                    Subject = snapshot.Subject ?? string.Empty,
+                    Body = snapshot.BodySnippet ?? string.Empty,
+                    FromAddress = snapshot.FromAddress ?? string.Empty,
+                    SenderDomain = snapshot.SenderDomain ?? string.Empty,
+                    HasAttachments = snapshot.HasAttachments,
                     Label = string.Empty
                 };
 
@@ -748,7 +789,7 @@ namespace OutlookClassifierAddIn5.UI
                     && !string.IsNullOrEmpty(predicted)
                     && IsValidFilingFolder(predicted))
                 {
-                    await MoveAndLogSelectedAsync(entryId, predicted, predicted, conf);
+                    await MoveAndLogSelectedAsync(entryId, predicted, predicted, conf, "AutoApprove");
                     ClearSingleView("Select an email");
                     return; // skip rendering the Single view since it's already moved
                 }
@@ -766,11 +807,8 @@ namespace OutlookClassifierAddIn5.UI
                 {
                     lblSubject.Text = row.Subject;
 
-                    var senderName = GetSenderDisplayName(mail);
-                    var pretty = !string.IsNullOrEmpty(smtp)
-                        ? (string.IsNullOrEmpty(senderName) ? smtp : (senderName + " <" + smtp + ">"))
-                        : (senderName ?? string.Empty);
-                    lblFrom.Text = pretty;
+                    var senderName = SenderResolutionService.GetSenderDisplayName(mail);
+                    lblFrom.Text = SenderResolutionService.ComposePretty(senderName, smtp);
 
                     lblConf.Text = "Conf: " + conf.ToString("0.00");
 
@@ -795,7 +833,7 @@ namespace OutlookClassifierAddIn5.UI
                                 return;
                             }
 
-                            await MoveAndLogSelectedAsync(_currentEntryId, _currentPredicted, fullTarget, _currentConf);
+                            await MoveAndLogSelectedAsync(_currentEntryId, _currentPredicted, fullTarget, _currentConf, "SuggestionButton");
                             ClearSingleView("Select an email");
                         };
                         top3Panel.Controls.Add(b);
@@ -821,8 +859,9 @@ namespace OutlookClassifierAddIn5.UI
 
                 if (this.InvokeRequired) this.BeginInvoke(ui); else ui();
             }
-            catch
+            catch (Exception ex)
             {
+                AppLogger.Error(ex, "Show selected email failed.");
                 ClearSingleView("Select an email");
             }
         }
@@ -856,7 +895,7 @@ namespace OutlookClassifierAddIn5.UI
                 return;
             }
 
-            await MoveAndLogSelectedAsync(_currentEntryId, _currentPredicted, chosen, _currentConf);
+            await MoveAndLogSelectedAsync(_currentEntryId, _currentPredicted, chosen, _currentConf, "ManualApprove");
             ClearSingleView("Select an email");
         }
 
@@ -866,68 +905,35 @@ namespace OutlookClassifierAddIn5.UI
 
             int n = Math.Min(BATCH_PAGE_SIZE, _batchItems.Count);
             var page = _batchItems.Take(n).ToList();
-
-            int moved = 0;
-            foreach (var item in page)
-            {
-                // Use new validation logic
-                string chosen = item.PredictedFolder;
-                if (!IsValidFilingFolder(chosen))
-                {
-                    var alt = (item.Top3 ?? new System.Collections.Generic.List<(string name, float p)>())
-                                .FirstOrDefault(t => IsValidFilingFolder(t.name));
-                    if (string.IsNullOrEmpty(alt.name)) continue;
-                    chosen = alt.name;
-                }
-
-                await MoveAndLogSelectedAsync(item.EntryId, item.PredictedFolder, chosen, item.Confidence);
-                moved++;
-            }
-
-            if (_queue != null)
-                await _queue.BuildQueuesAsync(_app);
-
-            RefreshQueues();
+            int moved = await ApproveBatchItemsAsync(page, "BatchApprove");
             MessageBox.Show($"Approved {moved} item(s).", "Approve All");
         }
 
 
         private async System.Threading.Tasks.Task MoveAndLogSelectedAsync(
-    string entryId, string predictedFolderPath, string chosenFolderPath, double confidence)
+            string entryId,
+            string predictedFolderPath,
+            string chosenFolderPath,
+            double confidence,
+            string source)
         {
             await SafeRun(async () =>
             {
-                var ns = _app.Session;
-                var mail = ns.GetItemFromID(entryId) as Outlook.MailItem;
-                if (mail == null) return;
-
-                // capture source path before move
-                var sourceFolder = mail.Parent as Outlook.MAPIFolder;
-                var sourcePath = GetFolderPath(sourceFolder);
-
-                var target = FolderMap.ResolveFolderByPath(chosenFolderPath, ns);
-                var moved = mail.Move(target) as Outlook.MailItem; // new EntryID after move
-                var newId = moved != null ? moved.EntryID : entryId;
-
-                // push undo record
-                var rec = new MoveRecord
-                {
-                    OldEntryId = entryId,
-                    NewEntryId = moved != null ? moved.EntryID : entryId,
-                    SourcePath = sourcePath,
-                    DestPath = chosenFolderPath,
-                    Utc = DateTime.UtcNow
-                };
+                var result = _moveService.MoveToFolder(entryId, predictedFolderPath, chosenFolderPath, confidence);
+                var rec = ToMoveRecord(result);
                 _undoStack.Push(rec);
-                RefreshQueues();
-                await _store.LogDecisionAsync(rec.NewEntryId, predictedFolderPath, chosenFolderPath, confidence);
-                // remove from current batch page (if present) and update counts immediately
-                this.BeginInvoke((Action)(() =>
+
+                await _store.RecordApprovalAsync(
+                    CreateFeedbackExample(result, source),
+                    CreateDecisionRecord(result, source),
+                    CancellationToken.None);
+
+                UI(() =>
                 {
-                    RemoveFromBatchById(entryId);  // old id on the page list
-                    RemoveFromBatchById(newId);    // in case queues used the new id
-                    RebindGridFromBatchItems();    // rebind -> row vanishes, counts update
-                }));
+                    RemoveFromBatchById(result.OldEntryId);
+                    RemoveFromBatchById(result.NewEntryId);
+                    RefreshQueues();
+                });
             });
         }
 
@@ -1008,7 +1014,7 @@ namespace OutlookClassifierAddIn5.UI
                     if (!exp.IsPaneVisible(Outlook.OlPane.olPreview))
                         exp.ShowPane(Outlook.OlPane.olPreview, true);
                 }
-                catch { /* some configs throw here; safe to ignore */ }
+                catch (Exception ex) { AppLogger.Warn("Could not show Outlook preview pane: " + ex.Message); }
 
                 // Clear any existing selection, then select only this item
                 try
@@ -1021,7 +1027,7 @@ namespace OutlookClassifierAddIn5.UI
                     foreach (var o in toRemove)
                         exp.RemoveFromSelection(o);
                 }
-                catch { /* best effort */ }
+                catch (Exception ex) { AppLogger.Warn("Could not clear Outlook selection: " + ex.Message); }
 
                 exp.AddToSelection(mail);   // single-item selection updates Reading Pane
                 exp.Activate();
@@ -1030,7 +1036,7 @@ namespace OutlookClassifierAddIn5.UI
             {
                 // Fallback: if the Reading Pane path fails for any reason, open an inspector
                 try { var ns = _app.Session; var mail = ns.GetItemFromID(entryId) as Outlook.MailItem; mail?.Display(); }
-                catch { }
+                catch (Exception fallbackEx) { AppLogger.Error(fallbackEx, "Fallback inspector open failed."); }
                 MessageBox.Show(ex.Message, "Open");
             }
         }
@@ -1040,14 +1046,11 @@ namespace OutlookClassifierAddIn5.UI
         public async Task SafeRun(Func<Task> fn)
         {
             try { await fn(); }
-            catch (Exception ex) { MessageBox.Show(ex.Message, "Error"); }
-        }
-
-        private static string ExtractDomain(string addr)
-        {
-            if (string.IsNullOrEmpty(addr)) return string.Empty;
-            int at = addr.IndexOf('@');
-            return at < 0 ? string.Empty : addr.Substring(at + 1).ToLowerInvariant();
+            catch (Exception ex)
+            {
+                AppLogger.Error(ex, "User action failed.");
+                MessageBox.Show(ex.Message, "Error");
+            }
         }
 
         private void Grid_CellToolTipTextNeeded(object sender, DataGridViewCellToolTipTextNeededEventArgs e)
@@ -1060,13 +1063,25 @@ namespace OutlookClassifierAddIn5.UI
         {
             await SafeRun(async () =>
             {
-                // Use the new filtered method: recent data, no deleted items
-                var rows = await _store.LoadTrainingRowsAsync(recentDays: 180, excludeDeletedItems: true);
-                if (rows == null) return;
+                SetStatus("Training model...");
+                var rows = await _store.LoadTrainingExamplesAsync(recentDays: ModelService.DefaultRecentDays, excludeSystemFolders: true);
+                if (rows == null || rows.Count == 0)
+                {
+                    SetStatus("Not enough training data.");
+                    return;
+                }
 
-                _ml.Train(rows, out var _);
-                if (!string.IsNullOrEmpty(savePath))
-                    _ml.Save(savePath);
+                var result = await Task.Run(() =>
+                {
+                    Microsoft.ML.Data.DataViewSchema schema;
+                    return _ml.TrainWithEvaluation(rows, ModelService.DefaultRecentDays, out schema);
+                });
+
+                var path = string.IsNullOrWhiteSpace(savePath) ? _modelPath : savePath;
+                if (!string.IsNullOrEmpty(path))
+                    _ml.Save(path);
+
+                SetStatus(result == null ? "Training complete." : result.ToStatusSummary());
 
                 // Re-score the currently selected email, if any
                 if (!string.IsNullOrEmpty(_currentEntryId))
@@ -1082,6 +1097,59 @@ namespace OutlookClassifierAddIn5.UI
             public string DestPath;
             public DateTime Utc;
         }
+
+        private static MoveRecord ToMoveRecord(MoveResult result)
+        {
+            return new MoveRecord
+            {
+                OldEntryId = result.OldEntryId ?? string.Empty,
+                NewEntryId = result.NewEntryId ?? string.Empty,
+                SourcePath = result.SourcePath ?? string.Empty,
+                DestPath = result.DestPath ?? string.Empty,
+                Utc = DateTime.UtcNow
+            };
+        }
+
+        private static FeedbackExample CreateFeedbackExample(MoveResult result, string source)
+        {
+            var snapshot = result.FeatureBeforeMove ?? new MailFeatureDto();
+            return new FeedbackExample
+            {
+                OldEntryId = result.OldEntryId ?? string.Empty,
+                NewEntryId = result.NewEntryId ?? string.Empty,
+                StoreId = string.IsNullOrWhiteSpace(result.StoreId) ? snapshot.StoreId : result.StoreId,
+                InternetMessageId = snapshot.InternetMessageId ?? string.Empty,
+                ConversationId = snapshot.ConversationId ?? string.Empty,
+                Subject = snapshot.Subject ?? string.Empty,
+                Body = snapshot.BodySnippet ?? string.Empty,
+                FromAddress = snapshot.FromAddress ?? string.Empty,
+                SenderDomain = snapshot.SenderDomain ?? string.Empty,
+                HasAttachments = snapshot.HasAttachments,
+                ChosenFolder = result.DestPath ?? string.Empty,
+                PredictedFolder = result.PredictedPath ?? string.Empty,
+                Confidence = result.Confidence,
+                CreatedUtc = DateTime.UtcNow,
+                ReceivedUtc = snapshot.ReceivedUtc,
+                Source = string.IsNullOrWhiteSpace(source) ? "Feedback" : source
+            };
+        }
+
+        private static DecisionRecord CreateDecisionRecord(MoveResult result, string source)
+        {
+            return new DecisionRecord
+            {
+                EntryId = result.NewEntryId ?? result.OldEntryId ?? string.Empty,
+                OldEntryId = result.OldEntryId ?? string.Empty,
+                NewEntryId = result.NewEntryId ?? string.Empty,
+                StoreId = result.StoreId ?? string.Empty,
+                Predicted = result.PredictedPath ?? string.Empty,
+                Chosen = result.DestPath ?? string.Empty,
+                Confidence = result.Confidence,
+                DecidedUtc = DateTime.UtcNow,
+                Source = string.IsNullOrWhiteSpace(source) ? "Decision" : source
+            };
+        }
+
         private readonly System.Collections.Generic.Stack<MoveRecord> _undoStack =
             new System.Collections.Generic.Stack<MoveRecord>();
 
@@ -1097,23 +1165,7 @@ namespace OutlookClassifierAddIn5.UI
 
             SafeRun(async () =>
             {
-                var ns = _app.Session;
-
-                // Try to find the item by the NEW id (post-move). Fall back to the old id.
-                Outlook.MailItem item = null;
-                try { item = ns.GetItemFromID(rec.NewEntryId) as Outlook.MailItem; } catch { }
-                if (item == null)
-                {
-                    try { item = ns.GetItemFromID(rec.OldEntryId) as Outlook.MailItem; } catch { }
-                }
-                if (item == null)
-                {
-                    MessageBox.Show("Couldn’t find the message to undo.", "Undo");
-                    return;
-                }
-
-                var src = FolderMap.ResolveFolderByPath(rec.SourcePath, ns);
-                item.Move(src);
+                _moveService.MoveBack(rec.NewEntryId, rec.OldEntryId, rec.SourcePath);
 
                 // Optional: log the undo as a correction back to source
                 await _store.LogDecisionAsync(rec.NewEntryId, rec.DestPath, rec.SourcePath, 1.0);
@@ -1171,15 +1223,6 @@ namespace OutlookClassifierAddIn5.UI
         {
             if (string.IsNullOrEmpty(entryId)) return;
             _batchItems.RemoveAll(it => string.Equals(it.EntryId, entryId, StringComparison.Ordinal));
-        }
-
-        private static string GetFolderPath(Outlook.MAPIFolder f)
-        {
-            if (f == null) return string.Empty;
-            string path = f.Name;
-            var p = f.Parent as Outlook.MAPIFolder;
-            while (p != null) { path = p.Name + "/" + path; p = p.Parent as Outlook.MAPIFolder; }
-            return path;
         }
 
         private static string ShortenPath(string path, int maxLen = 48)
@@ -1336,22 +1379,66 @@ namespace OutlookClassifierAddIn5.UI
             // Capture a stable, user-friendly label for the dialog
             var folderCaption = ShortenPath(StripAccountRoot(groupKey), 72);
 
-            int moved = 0;
-            foreach (var item in items.ToList())
-            {
-                string chosen = GetEffectiveTarget(item);
-                if (string.IsNullOrEmpty(chosen)) continue;
-
-                await MoveAndLogSelectedAsync(item.EntryId, item.PredictedFolder, chosen, item.Confidence);
-                moved++;
-            }
-
-            if (_queue != null)
-                await _queue.BuildQueuesAsync(_app);
-
-            UI(() => RefreshQueues());
+            int moved = await ApproveBatchItemsAsync(items.ToList(), "GroupApprove");
 
             MessageBox.Show($"Approved {moved} item(s) in \"{folderCaption}\".", "Approve Group");
+        }
+
+        private async Task<int> ApproveBatchItemsAsync(List<Services.QueueService.Item> items, string source)
+        {
+            if (items == null || items.Count == 0) return 0;
+
+            if (btnApproveAll != null) btnApproveAll.Enabled = false;
+            if (btnRemoveSelected != null) btnRemoveSelected.Enabled = false;
+            SetStatus("Approving " + items.Count + " item(s)...");
+
+            var feedback = new List<FeedbackExample>();
+            var decisions = new List<DecisionRecord>();
+            var movedIds = new HashSet<string>(StringComparer.Ordinal);
+            var moved = 0;
+
+            try
+            {
+                foreach (var item in items)
+                {
+                    string chosen = GetEffectiveTarget(item);
+                    if (string.IsNullOrEmpty(chosen) || !IsValidFilingFolder(chosen))
+                        continue;
+
+                    try
+                    {
+                        var result = _moveService.MoveToFolder(item.EntryId, item.PredictedFolder, chosen, item.Confidence);
+                        _undoStack.Push(ToMoveRecord(result));
+                        feedback.Add(CreateFeedbackExample(result, source));
+                        decisions.Add(CreateDecisionRecord(result, source));
+                        movedIds.Add(result.OldEntryId);
+                        movedIds.Add(result.NewEntryId);
+                        moved++;
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLogger.Error(ex, "Batch move failed for EntryId " + item.EntryId + ".");
+                    }
+                }
+
+                if (feedback.Count > 0 || decisions.Count > 0)
+                    await _store.RecordApprovalsAsync(feedback, decisions, CancellationToken.None);
+
+                foreach (var id in movedIds)
+                    RemoveFromBatchById(id);
+
+                if (_queue != null)
+                    await _queue.BuildQueuesAsync(_app);
+
+                UI(() => RefreshQueues());
+                SetStatus("Approved " + moved + " item(s).");
+                return moved;
+            }
+            finally
+            {
+                if (btnRemoveSelected != null) btnRemoveSelected.Enabled = true;
+                UpdateBatchCountsUi();
+            }
         }
 
         // Add this helper method to TaskPaneControl
@@ -1386,25 +1473,26 @@ namespace OutlookClassifierAddIn5.UI
                             var ns = _app.Session;
                             var folder = FolderMap.ResolveFolderByPath(p, ns);
                             if (folder != null) // Only add if folder actually exists
-                                _mailFolderPathsFull.Add(p);
+                                _mailFolderPathsFull.Add(FolderPathNormalizer.Normalize(p));
                         }
-                        catch
+                        catch (Exception ex)
                         {
-                            // Skip folders that can't be resolved (deleted/moved folders)
+                            AppLogger.Warn("Folder skipped during cache refresh because it could not be resolved: " + p + " " + ex.Message);
                         }
                     }
                 }
 
                 // Refresh the combo box items
                 var items = BuildFolderItems("");
+                _folderList = items;
                 _suppressFilter = true;
                 cmbFolders.Items.Clear();
                 foreach (var it in items) cmbFolders.Items.Add(it);
                 _suppressFilter = false;
             }
-            catch
+            catch (Exception ex)
             {
-                // If refresh fails, keep existing folder list
+                AppLogger.Error(ex, "Folder cache refresh failed.");
             }
         }
 
@@ -1419,9 +1507,9 @@ namespace OutlookClassifierAddIn5.UI
                 else
                     RefreshQueues();
             }
-            catch
+            catch (Exception ex)
             {
-                // Non-fatal: leave Batch empty if a scan fails. You can log if desired.
+                AppLogger.Error(ex, "Queue build failed during pane refresh.");
             }
         }
 
@@ -1452,23 +1540,17 @@ namespace OutlookClassifierAddIn5.UI
 
         private static string NormalizePath(string path)
         {
-            return string.IsNullOrWhiteSpace(path)
-                ? string.Empty
-                : path.Replace('\\', '/').Trim().Trim('/');
+            return FolderPathNormalizer.Normalize(path);
         }
 
         private static string StripAccountRoot(string path)
         {
-            var p = NormalizePath(path);
-            int i = p.IndexOf('/');
-            return i >= 0 ? p.Substring(i + 1) : p;
+            return FolderPathNormalizer.StripAccountRoot(path);
         }
 
         private static string GetLeaf(string path)
         {
-            var p = NormalizePath(path);
-            int i = p.LastIndexOf('/');
-            return i >= 0 ? p.Substring(i + 1) : p;
+            return FolderPathNormalizer.Leaf(path);
         }
 
         private static string ToShortDisplay(string path)
@@ -1530,7 +1612,7 @@ namespace OutlookClassifierAddIn5.UI
                 int screenCap = screen.Width / 2; // don’t let it be half the screen
                 cmbFolders.DropDownWidth = Math.Min(desiredWidth, screenCap);
             }
-            catch { /* layout races: ignore */ }
+            catch (Exception ex) { AppLogger.Warn("Combo dropdown sizing failed: " + ex.Message); }
         }
 
         private static int ComputeDropDownWidth(ComboBox cb, int hardCap)
@@ -1547,113 +1629,10 @@ namespace OutlookClassifierAddIn5.UI
             return Math.Min(width, hardCap);
         }
 
-        private static string GetSenderSmtpAddress(Outlook.MailItem mail)
-        {
-            if (mail == null) return string.Empty;
-
-            try
-            {
-                // If Outlook already gives SMTP, use it
-                if (!string.IsNullOrEmpty(mail.SenderEmailAddress) &&
-                    !mail.SenderEmailAddress.StartsWith("/O=", StringComparison.OrdinalIgnoreCase))
-                {
-                    return mail.SenderEmailAddress;
-                }
-
-                Outlook.AddressEntry sender = mail.Sender;
-                if (sender == null)
-                {
-                    try { mail.Recipients?.ResolveAll(); } catch { }
-                    sender = mail.Sender;
-                }
-                if (sender == null) return mail.SenderEmailAddress ?? string.Empty;
-
-                // 1) Exchange users (internal or remote)
-                if (sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olExchangeUserAddressEntry ||
-                    sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olExchangeRemoteUserAddressEntry)
-                {
-                    var ex = sender.GetExchangeUser();
-                    if (ex != null && !string.IsNullOrEmpty(ex.PrimarySmtpAddress))
-                        return ex.PrimarySmtpAddress;
-                }
-
-                // 2) SMTP entries (external)
-                if (sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olSmtpAddressEntry)
-                {
-                    // Often Address is already SMTP here
-                    if (!string.IsNullOrEmpty(sender.Address) &&
-                        !sender.Address.StartsWith("/O=", StringComparison.OrdinalIgnoreCase))
-                        return sender.Address;
-                }
-
-                // 3) Fallback: PR_SMTP_ADDRESS on the AddressEntry
-                const string PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E";
-                try
-                {
-                    var pa = sender.PropertyAccessor;
-                    var smtp = pa.GetProperty(PR_SMTP_ADDRESS) as string;
-                    if (!string.IsNullOrEmpty(smtp)) return smtp;
-                }
-                catch { /* some stores may not expose it */ }
-
-                // 4) Last-resort fallbacks
-                if (!string.IsNullOrEmpty(mail.SenderEmailAddress) &&
-                    !mail.SenderEmailAddress.StartsWith("/O=", StringComparison.OrdinalIgnoreCase))
-                    return mail.SenderEmailAddress;
-
-                // Give at least a name if all else fails
-                return sender.Name ?? mail.SenderName ?? (mail.ReplyRecipients?.Count > 0 ? mail.ReplyRecipients[1].Address : string.Empty) ?? string.Empty;
-            }
-            catch
-            {
-                return mail.SenderEmailAddress ?? string.Empty;
-            }
-        }
-
-        private static string GetSenderDisplayName(Outlook.MailItem mail)
-        {
-            try
-            {
-                var sender = mail?.Sender;
-                if (sender == null) return mail?.SenderName ?? string.Empty;
-
-                // Prefer Exchange display name if available
-                if (sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olExchangeUserAddressEntry ||
-                    sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olExchangeRemoteUserAddressEntry)
-                {
-                    var ex = sender.GetExchangeUser();
-                    if (ex != null && !string.IsNullOrEmpty(ex.Name))
-                        return ex.Name;
-                }
-                return sender.Name ?? mail?.SenderName ?? string.Empty;
-            }
-            catch { return mail?.SenderName ?? string.Empty; }
-        }
-
-        public void BindFromCache(OutlookClassifierAddIn5.Services.QueueCache cache)
-        {
-            if (this.InvokeRequired) { this.BeginInvoke((System.Action)(() => BindFromCache(cache))); return; }
-            if (cache == null) return;
-
-            // Fill the queue from cache and refresh the UI
-            _queue.SetFromCache(cache);
-            RefreshQueues();
-
-            // Optional: tell the user we loaded cached results
-            if (lblStats != null)
-                lblStats.Text = "Loaded cached results • Refreshing…";
-        }
-
         // inside OutlookClassifierAddIn5.UI.TaskPaneControl
         public void Deactivate()
         {
-            try { _showCts?.Cancel(); } catch { }
-        }
-
-        private static bool LooksLegacyDn(string s)
-        {
-            return !string.IsNullOrEmpty(s) &&
-                   s.StartsWith("/O=", StringComparison.OrdinalIgnoreCase);
+            try { _showCts?.Cancel(); } catch (Exception ex) { AppLogger.Warn("Selection cancellation failed: " + ex.Message); }
         }
 
         private string GetPrettyFrom(string entryId, string raw)
@@ -1664,7 +1643,7 @@ namespace OutlookClassifierAddIn5.UI
                 return cached;
 
             // Already SMTP-looking? Just show it.
-            if (!LooksLegacyDn(raw))
+            if (!SenderResolutionService.LooksLegacyDn(raw))
                 return raw ?? string.Empty;
 
             // Resolve via MailItem (only for visible rows, so this is cheap)
@@ -1675,55 +1654,19 @@ namespace OutlookClassifierAddIn5.UI
                 mi = ns?.GetItemFromID(entryId) as Outlook.MailItem;
                 if (mi == null) return raw ?? string.Empty;
 
-                string display = mi.SenderName ?? string.Empty;
-                string smtp = mi.SenderEmailAddress ?? string.Empty;
-
-                try
-                {
-                    // If SMTP is still legacy, try ExchangeUser + PR_SMTP_ADDRESS
-                    if (LooksLegacyDn(smtp))
-                    {
-                        var sender = mi.Sender;
-                        if (sender != null)
-                        {
-                            if (sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olExchangeUserAddressEntry ||
-                                sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olExchangeRemoteUserAddressEntry)
-                            {
-                                var ex = sender.GetExchangeUser();
-                                if (ex != null)
-                                {
-                                    if (!string.IsNullOrEmpty(ex.PrimarySmtpAddress)) smtp = ex.PrimarySmtpAddress;
-                                    if (!string.IsNullOrEmpty(ex.Name)) display = ex.Name;
-                                }
-                            }
-
-                            if (LooksLegacyDn(smtp))
-                            {
-                                const string PR_SMTP = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E";
-                                try
-                                {
-                                    var pa = sender.PropertyAccessor;
-                                    var addr = pa.GetProperty(PR_SMTP) as string;
-                                    if (!string.IsNullOrEmpty(addr)) smtp = addr;
-                                }
-                                catch { }
-                            }
-                        }
-                    }
-                }
-                catch { }
-
-                var pretty = !string.IsNullOrEmpty(smtp)
-                    ? (string.IsNullOrEmpty(display) ? smtp : (display + " <" + smtp + ">"))
-                    : (string.IsNullOrEmpty(display) ? raw ?? string.Empty : display);
+                string display = SenderResolutionService.GetSenderDisplayName(mi);
+                string smtp = SenderResolutionService.GetSenderSmtpAddress(mi);
+                var pretty = SenderResolutionService.ComposePretty(display, smtp);
+                if (string.IsNullOrWhiteSpace(pretty)) pretty = raw ?? string.Empty;
 
                 if (!string.IsNullOrEmpty(entryId))
                     _prettyFromCache[entryId] = pretty;
 
                 return pretty;
             }
-            catch
+            catch (Exception ex)
             {
+                AppLogger.Warn("Pretty sender resolution failed: " + ex.Message);
                 return raw ?? string.Empty;
             }
             finally

@@ -12,30 +12,10 @@ using Outlook = Microsoft.Office.Interop.Outlook;
 namespace OutlookClassifierAddIn5.Services
 {
 
-    // ---- Cache DTOs ----
-    public sealed class QueueCache
-    {
-        public string FolderSnapshotHash;
-        public DateTime BuiltUtc;
-
-        public List<BatchItemDto> High = new List<BatchItemDto>();
-        public List<BatchItemDto> Medium = new List<BatchItemDto>();
-        public List<BatchItemDto> Low = new List<BatchItemDto>();
-    }
-
-    public sealed class BatchItemDto
-    {
-        public string EntryId;
-        public string Subject;
-        public string From;
-        public string PredictedFullPath;
-        public double Confidence;
-        public List<Tuple<string, float>> Top3; // name, p
-    }
-
-
     public class QueueService
     {
+        private const string PrSenderSmtpAddress = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F";
+
         public sealed class Item
         {
             public string EntryId { get; }
@@ -77,110 +57,7 @@ namespace OutlookClassifierAddIn5.Services
         // Ignore messages that are currently flagged (active follow-up)
         public bool IgnoreFlaggedForBatching { get; set; } = true;
 
-        // Simple "model hash" placeholder; if you later expose a real model signature, return it here.
-        public string CurrentModelHash { get { return (_ml != null) ? "loaded" : "none"; } }
-
-        // Compute a stable hash of folder full paths, to know when cache is stale
-        public static string ComputeFolderSnapshotHash(IEnumerable<string> fullPaths)
-        {
-            var list = new List<string>();
-            foreach (var p in fullPaths ?? new List<string>())
-            {
-                var s = (p ?? "").Replace('\\', '/').Trim();
-                list.Add(s);
-            }
-            list.Sort(StringComparer.OrdinalIgnoreCase);
-            var sAll = string.Join("\n", list.ToArray());
-            using (var sha = System.Security.Cryptography.SHA256.Create())
-            {
-                var bytes = System.Text.Encoding.UTF8.GetBytes(sAll);
-                var hash = sha.ComputeHash(bytes);
-                return BitConverter.ToString(hash).Replace("-", "");
-            }
-        }
-
-        // Persist/restore cache
-        public QueueCache LoadCache(string path)
-        {
-            try
-            {
-                if (!System.IO.File.Exists(path)) return null;
-                var json = System.IO.File.ReadAllText(path);
-                return Newtonsoft.Json.JsonConvert.DeserializeObject<QueueCache>(json);
-            }
-            catch { return null; }
-        }
-
-        public void SaveCache(string path, QueueCache cache)
-        {
-            try
-            {
-                var dir = System.IO.Path.GetDirectoryName(path);
-                if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
-                var json = Newtonsoft.Json.JsonConvert.SerializeObject(cache);
-                System.IO.File.WriteAllText(path, json);
-            }
-            catch { /* ignore */ }
-        }
-
-        // Build a cache snapshot from current in-memory items
-        public QueueCache SnapshotToCache(IEnumerable<string> folderFullPaths)
-        {
-            var cache = new QueueCache();
-            cache.FolderSnapshotHash = ComputeFolderSnapshotHash(folderFullPaths);
-            cache.BuiltUtc = DateTime.UtcNow;
-
-            Func<Item, BatchItemDto> toDto = it =>
-            {
-                var dto = new BatchItemDto();
-                dto.EntryId = it.EntryId;
-                dto.Subject = it.Subject;
-                dto.From = it.From;
-                dto.PredictedFullPath = it.PredictedFolder;
-                dto.Confidence = it.Confidence;
-                // Top3: convert value tuples to serializable tuples
-                var list = new List<Tuple<string, float>>();
-                foreach (var t in it.Top3)
-                    list.Add(Tuple.Create(t.name, t.p));
-                dto.Top3 = list;
-                return dto;
-            };
-
-            foreach (var it in _high) cache.High.Add(toDto(it));
-            foreach (var it in _medium) cache.Medium.Add(toDto(it));
-            foreach (var it in _low) cache.Low.Add(toDto(it));
-
-            return cache;
-        }
-
-        // Restore in-memory queues from cache (fast bind path)
-        public void SetFromCache(QueueCache cache)
-        {
-            _high.Clear(); _medium.Clear(); _low.Clear();
-            if (cache == null) return;
-
-            Func<BatchItemDto, Item> fromDto = d =>
-            {
-                var top3 = new List<(string name, float p)>();
-                if (d.Top3 != null)
-                {
-                    foreach (var t in d.Top3)
-                        top3.Add((t.Item1, t.Item2));
-                }
-                return new Item(
-                    d.EntryId ?? string.Empty,
-                    d.Subject ?? string.Empty,
-                    d.From ?? string.Empty,
-                    d.PredictedFullPath ?? string.Empty,
-                    d.Confidence,
-                    top3
-                );
-            };
-
-            foreach (var d in cache.High) _high.Add(fromDto(d));
-            foreach (var d in cache.Medium) _medium.Add(fromDto(d));
-            foreach (var d in cache.Low) _low.Enqueue(fromDto(d));
-        }
+        public string CurrentModelHash { get { return (_ml != null) ? _ml.ModelSignature : "none"; } }
 
         public async Task BuildQueuesAsync(Outlook.Application app)
         {
@@ -193,6 +70,8 @@ namespace OutlookClassifierAddIn5.Services
             _low.Clear(); _medium.Clear(); _high.Clear();
             if (app == null) return;
 
+            AppLogger.Info("Queue build start. DaysBack=" + daysBack + ".");
+
             // Snapshot valid filing folders
             var validPaths = new List<string>();
             var all = FolderMap.GetAllFolderPaths(app);
@@ -200,7 +79,7 @@ namespace OutlookClassifierAddIn5.Services
             {
                 foreach (var p in all)
                     if (IsValidFilingFolder(p))
-                        validPaths.Add(Normalize(p));
+                        validPaths.Add(FolderPathNormalizer.Normalize(p));
             }
 
             var ns = app.Session;
@@ -217,11 +96,12 @@ namespace OutlookClassifierAddIn5.Services
             table.Columns.Add("EntryID");
             table.Columns.Add("Subject");
             table.Columns.Add("SenderEmailAddress");
+            TryAddColumn(table, PrSenderSmtpAddress);
             table.Columns.Add("ReceivedTime");
             table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x0E1B000B"); // HasAttachment
             table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x10900003"); // FlagStatus
 
-            try { table.Sort("[ReceivedTime]", Outlook.OlSortOrder.olDescending); } catch { }
+            try { table.Sort("[ReceivedTime]", Outlook.OlSortOrder.olDescending); } catch (Exception ex) { AppLogger.Warn("Queue table sort failed: " + ex.Message); }
 
             const int cap = 500;
             int count = 0;
@@ -231,6 +111,8 @@ namespace OutlookClassifierAddIn5.Services
                 var entryId = SafeRowString(r, "EntryID");
                 var subject = SafeRowString(r, "Subject");
                 var fromRaw = SafeRowString(r, "SenderEmailAddress");
+                var fromSmtp = SafeRowString(r, PrSenderSmtpAddress);
+                var featureSender = SenderResolutionService.ChooseFeatureAddress(fromSmtp, fromRaw);
                 var hasAtt = SafeRowBool(r, "http://schemas.microsoft.com/mapi/proptag/0x0E1B000B");
 
                 int flagStatus = 0;
@@ -240,7 +122,7 @@ namespace OutlookClassifierAddIn5.Services
                     if (fv is int) flagStatus = (int)fv;
                     else if (fv is string) { int tmp; if (int.TryParse((string)fv, out tmp)) flagStatus = tmp; }
                 }
-                catch { }
+                    catch (Exception ex) { AppLogger.Warn("Queue flag read failed: " + ex.Message); }
 
                 if (IgnoreFlaggedForBatching && flagStatus == 2) // olFlagMarked
                     continue;
@@ -249,8 +131,8 @@ namespace OutlookClassifierAddIn5.Services
                 {
                     Subject = subject ?? string.Empty,
                     Body = string.Empty,                         // fast path: no Body
-                    FromAddress = fromRaw ?? string.Empty,              // raw to match training
-                    SenderDomain = ExtractDomain(fromRaw ?? string.Empty),
+                    FromAddress = featureSender,
+                    SenderDomain = SenderResolutionService.ExtractDomain(featureSender),
                     HasAttachments = hasAtt,
                     Label = string.Empty
                 };
@@ -296,6 +178,7 @@ namespace OutlookClassifierAddIn5.Services
             }
 
             _medium.Sort((a, b) => Margin(a).CompareTo(Margin(b)));
+            AppLogger.Info("Queue build end. High=" + _high.Count + ", medium=" + _medium.Count + ", low=" + _low.Count + ".");
             await Task.CompletedTask;
 
         }
@@ -320,7 +203,7 @@ namespace OutlookClassifierAddIn5.Services
         private static string CanonicalizeToFull(string label, List<string> validPaths, Outlook.Application app)
         {
             if (string.IsNullOrWhiteSpace(label)) return string.Empty;
-            var s = Normalize(label);
+            var s = FolderPathNormalizer.Normalize(label);
 
             // Exact path match? done.
             if (s.IndexOf('/') >= 0)
@@ -351,7 +234,7 @@ namespace OutlookClassifierAddIn5.Services
                         return underDefault;
                 }
             }
-            catch { /* ignore and fall through */ }
+            catch (Exception ex) { AppLogger.Warn("Default store preference failed during canonicalization: " + ex.Message); }
 
             return string.Empty;
         }
@@ -360,15 +243,6 @@ namespace OutlookClassifierAddIn5.Services
         public Item PeekLow() => _low.Count > 0 ? _low.Peek() : null;
         public async Task PopLowAsync() { if (_low.Count > 0) _low.Dequeue(); await Task.CompletedTask; }
 
-        private static string ExtractDomain(string addr)
-        {
-            int at = addr.IndexOf('@');
-            if (at < 0)
-                return string.Empty;
-
-
-            return addr.Substring(at + 1).ToLowerInvariant();
-        }
         private static double Margin(Item it) => it.Top3.Count >= 2 ? (it.Top3[0].p - it.Top3[1].p) : 1.0;
 
 
@@ -400,86 +274,10 @@ namespace OutlookClassifierAddIn5.Services
             return false;
         }
 
-        private static bool IsActivelyFlagged(Outlook.MailItem m)
+        private static void TryAddColumn(Outlook.Table table, string name)
         {
-            try
-            {
-                // FlagStatus covers most cases:
-                //  - olFlagMarked   => user flagged (active)
-                //  - olFlagComplete => completed (treat as not flagged)
-                //  - olNoFlag       => not flagged
-                var fs = m.FlagStatus;
-                if (fs == Outlook.OlFlagStatus.olFlagMarked) return true;
-                if (fs == Outlook.OlFlagStatus.olFlagComplete) return false;
-
-                // Some stores use IsMarkedAsTask for follow-ups
-                if (m.IsMarkedAsTask) return true;
-            }
-            catch { /* some providers don’t expose flags cleanly */ }
-            return false;
-        }
-
-        // Resolve display + SMTP for a MailItem sender
-        private static void ResolveSender(Outlook.MailItem m, out string display, out string smtp)
-        {
-            display = m?.SenderName ?? string.Empty;
-            smtp = m?.SenderEmailAddress ?? string.Empty;
-
-            try
-            {
-                // Already SMTP-looking? done.
-                if (!string.IsNullOrEmpty(smtp) &&
-                    !smtp.StartsWith("/O=", StringComparison.OrdinalIgnoreCase))
-                    return;
-
-                var sender = m?.Sender;
-                if (sender != null)
-                {
-                    // Exchange internal/remote user
-                    if (sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olExchangeUserAddressEntry ||
-                        sender.AddressEntryUserType == Outlook.OlAddressEntryUserType.olExchangeRemoteUserAddressEntry)
-                    {
-                        var ex = sender.GetExchangeUser();
-                        if (ex != null)
-                        {
-                            if (!string.IsNullOrEmpty(ex.PrimarySmtpAddress)) smtp = ex.PrimarySmtpAddress;
-                            if (!string.IsNullOrEmpty(ex.Name)) display = ex.Name;
-                        }
-                    }
-
-                    // Try generic SMTP MAPI property
-                    if (string.IsNullOrEmpty(smtp))
-                    {
-                        const string PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E";
-                        try
-                        {
-                            var pa = sender.PropertyAccessor;
-                            var addr = pa.GetProperty(PR_SMTP_ADDRESS) as string;
-                            if (!string.IsNullOrEmpty(addr)) smtp = addr;
-                        }
-                        catch { /* ignore */ }
-                    }
-
-                    if (string.IsNullOrEmpty(display))
-                        display = sender.Name ?? display;
-                }
-
-                // Keep empty instead of legacy DN if still unresolved
-                if (string.IsNullOrEmpty(smtp) ||
-                    smtp.StartsWith("/O=", StringComparison.OrdinalIgnoreCase))
-                    smtp = string.Empty;
-            }
-            catch
-            {
-                // leave best effort
-            }
-        }
-
-        private static string ComposeFromPretty(string display, string smtp)
-        {
-            if (!string.IsNullOrEmpty(smtp))
-                return string.IsNullOrEmpty(display) ? smtp : (display + " <" + smtp + ">");
-            return display ?? string.Empty;
+            try { table.Columns.Add(name); }
+            catch (Exception ex) { AppLogger.Warn("Could not add Outlook table column " + name + ": " + ex.Message); }
         }
     }
 }

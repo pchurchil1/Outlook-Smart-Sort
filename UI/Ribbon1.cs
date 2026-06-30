@@ -33,7 +33,9 @@ namespace OutlookClassifierAddIn5.UI
         private void chkAutoApprove_Click(object sender, RibbonControlEventArgs e)
         {
             if (Globals.ThisAddIn.PaneControl == null) Globals.ThisAddIn.TogglePane();
-            Globals.ThisAddIn?.PaneControl?.SetAutoApprove(((RibbonCheckBox)sender).Checked);
+            var check = (RibbonCheckBox)sender;
+            var enabled = Globals.ThisAddIn?.PaneControl?.SetAutoApprove(check.Checked) ?? false;
+            check.Checked = enabled;
         }
     }
 }

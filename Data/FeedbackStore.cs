@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data.SQLite;
 using System.IO;
@@ -6,24 +6,68 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Dapper;
+using Newtonsoft.Json;
 using OutlookClassifierAddIn5.ML;
-using OutlookClassifierAddIn5.Services; // for ScanService.SeedRow / SeedBody
+using OutlookClassifierAddIn5.Services;
 
 namespace OutlookClassifierAddIn5.Data
 {
+    public sealed class FeedbackExample
+    {
+        public string OldEntryId { get; set; }
+        public string NewEntryId { get; set; }
+        public string StoreId { get; set; }
+        public string InternetMessageId { get; set; }
+        public string ConversationId { get; set; }
+        public string Subject { get; set; }
+        public string Body { get; set; }
+        public string FromAddress { get; set; }
+        public string SenderDomain { get; set; }
+        public bool HasAttachments { get; set; }
+        public string ChosenFolder { get; set; }
+        public string PredictedFolder { get; set; }
+        public double Confidence { get; set; }
+        public DateTime CreatedUtc { get; set; }
+        public DateTime? ReceivedUtc { get; set; }
+        public string Source { get; set; }
+    }
+
+    public sealed class DecisionRecord
+    {
+        public string EntryId { get; set; }
+        public string OldEntryId { get; set; }
+        public string NewEntryId { get; set; }
+        public string StoreId { get; set; }
+        public string Predicted { get; set; }
+        public string Chosen { get; set; }
+        public double Confidence { get; set; }
+        public DateTime DecidedUtc { get; set; }
+        public string Source { get; set; }
+    }
+
     public class FeedbackStore
     {
+        private const int CurrentSchemaVersion = 3;
+        private const int DefaultBodySnippetLength = 1000;
+
         private readonly string _dbPath;
         private readonly string _connStr;
 
         public FeedbackStore()
         {
-            var dir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "OutlookClassifier");
-            Directory.CreateDirectory(dir);
-            _dbPath = Path.Combine(dir, "store.sqlite");
-            _connStr = $"Data Source={_dbPath};Version=3;";
+            Directory.CreateDirectory(AppLogger.DataDirectory);
+            _dbPath = Path.Combine(AppLogger.DataDirectory, "store.sqlite");
+            _connStr = "Data Source=" + _dbPath + ";Version=3;";
+        }
+
+        public string DatabasePath
+        {
+            get { return _dbPath; }
+        }
+
+        public string DataFolder
+        {
+            get { return AppLogger.DataDirectory; }
         }
 
         public void Initialize()
@@ -31,51 +75,190 @@ namespace OutlookClassifierAddIn5.Data
             using (var conn = new SQLiteConnection(_connStr))
             {
                 conn.Open();
+                ExecutePragmas(conn);
 
-                // Pragmas suitable for a local, single-user store
+                using (var tx = conn.BeginTransaction())
+                {
+                    conn.Execute(@"CREATE TABLE IF NOT EXISTS Meta (Key TEXT PRIMARY KEY, Value TEXT NOT NULL);", transaction: tx);
+                    tx.Commit();
+                }
+
                 try
                 {
-                    conn.Execute("PRAGMA journal_mode=WAL;");
-                    conn.Execute("PRAGMA synchronous=NORMAL;");
-                    conn.Execute("PRAGMA temp_store=MEMORY;");
-                    conn.Execute("PRAGMA foreign_keys=ON;");
+                    var version = GetSchemaVersion(conn);
+                    AppLogger.Info("Database schema version before migrations: " + version);
+
+                    if (version < 1) Migrate0To1(conn);
+                    if (version < 2) Migrate1To2(conn);
+                    if (version < 3) Migrate2To3(conn);
+
+                    AppLogger.Info("Database schema ready at version " + CurrentSchemaVersion + ".");
                 }
-                catch { /* pragma failures are non-fatal */ }
-
-                // Core tables
-                conn.Execute(@"
-                CREATE TABLE IF NOT EXISTS Emails (
-                  EntryId TEXT PRIMARY KEY,
-                  Folder TEXT,
-                  Subject TEXT,
-                  Body TEXT,
-                  FromAddress TEXT,
-                  SenderDomain TEXT,
-                  HasAttachments INTEGER,
-                  ReceivedUtc TEXT
-                );");
-
-                conn.Execute(@"
-                CREATE TABLE IF NOT EXISTS Decisions (
-                  EntryId TEXT PRIMARY KEY,
-                  Predicted TEXT,
-                  Chosen TEXT,
-                  Confidence REAL,
-                  DecidedUtc TEXT
-                );");
-
-                conn.Execute(@"CREATE TABLE IF NOT EXISTS Meta (Key TEXT PRIMARY KEY, Value TEXT);");
-
-                // Helpful indexes
-                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_Folder ON Emails(Folder);");
-                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_SenderDomain ON Emails(SenderDomain);");
-                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_ReceivedUtc ON Emails(ReceivedUtc);");
+                catch (Exception ex)
+                {
+                    AppLogger.Error(ex, "Schema migration failed.");
+                    throw;
+                }
             }
         }
 
-        // --------------------------------------------------------------------
-        // Single-row API (kept for compatibility with existing call sites)
-        // --------------------------------------------------------------------
+        private static void ExecutePragmas(SQLiteConnection conn)
+        {
+            try
+            {
+                conn.Execute("PRAGMA journal_mode=WAL;");
+                conn.Execute("PRAGMA synchronous=NORMAL;");
+                conn.Execute("PRAGMA temp_store=MEMORY;");
+                conn.Execute("PRAGMA foreign_keys=ON;");
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Warn("SQLite pragma setup failed: " + ex.Message);
+            }
+        }
+
+        private static int GetSchemaVersion(SQLiteConnection conn)
+        {
+            var value = conn.ExecuteScalar<string>("SELECT Value FROM Meta WHERE Key = 'SchemaVersion';");
+            int version;
+            return int.TryParse(value, out version) ? version : 0;
+        }
+
+        private static void SetSchemaVersion(SQLiteConnection conn, SQLiteTransaction tx, int version)
+        {
+            conn.Execute(
+                "INSERT OR REPLACE INTO Meta (Key, Value) VALUES ('SchemaVersion', @Value);",
+                new { Value = version.ToString() },
+                tx);
+        }
+
+        private static void Migrate0To1(SQLiteConnection conn)
+        {
+            using (var tx = conn.BeginTransaction())
+            {
+                AppLogger.Info("Applying schema migration 0 -> 1.");
+
+                conn.Execute(@"
+CREATE TABLE IF NOT EXISTS Emails (
+  EntryId TEXT PRIMARY KEY,
+  StoreId TEXT,
+  InternetMessageId TEXT,
+  ConversationId TEXT,
+  NormalizedSubjectHash TEXT,
+  Folder TEXT,
+  Subject TEXT,
+  Body TEXT,
+  FromAddress TEXT,
+  SenderDomain TEXT,
+  HasAttachments INTEGER,
+  ReceivedUtc TEXT
+);", transaction: tx);
+
+                conn.Execute(@"
+CREATE TABLE IF NOT EXISTS Decisions (
+  EntryId TEXT PRIMARY KEY,
+  OldEntryId TEXT,
+  NewEntryId TEXT,
+  StoreId TEXT,
+  Predicted TEXT,
+  Chosen TEXT,
+  Confidence REAL,
+  DecidedUtc TEXT,
+  Source TEXT
+);", transaction: tx);
+
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_Folder ON Emails(Folder);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_SenderDomain ON Emails(SenderDomain);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_ReceivedUtc ON Emails(ReceivedUtc);", transaction: tx);
+
+                SetSchemaVersion(conn, tx, 1);
+                tx.Commit();
+            }
+        }
+
+        private static void Migrate1To2(SQLiteConnection conn)
+        {
+            using (var tx = conn.BeginTransaction())
+            {
+                AppLogger.Info("Applying schema migration 1 -> 2.");
+
+                AddColumnIfMissing(conn, tx, "Emails", "StoreId", "TEXT");
+                AddColumnIfMissing(conn, tx, "Emails", "InternetMessageId", "TEXT");
+                AddColumnIfMissing(conn, tx, "Emails", "ConversationId", "TEXT");
+                AddColumnIfMissing(conn, tx, "Emails", "NormalizedSubjectHash", "TEXT");
+
+                AddColumnIfMissing(conn, tx, "Decisions", "OldEntryId", "TEXT");
+                AddColumnIfMissing(conn, tx, "Decisions", "NewEntryId", "TEXT");
+                AddColumnIfMissing(conn, tx, "Decisions", "StoreId", "TEXT");
+                AddColumnIfMissing(conn, tx, "Decisions", "Source", "TEXT");
+
+                conn.Execute(@"
+CREATE TABLE IF NOT EXISTS FeedbackExamples (
+  Id INTEGER PRIMARY KEY AUTOINCREMENT,
+  OldEntryId TEXT,
+  NewEntryId TEXT,
+  StoreId TEXT,
+  InternetMessageId TEXT,
+  ConversationId TEXT,
+  NormalizedSubjectHash TEXT,
+  Subject TEXT,
+  Body TEXT,
+  FromAddress TEXT,
+  SenderDomain TEXT,
+  HasAttachments INTEGER,
+  ChosenFolder TEXT NOT NULL,
+  PredictedFolder TEXT,
+  Confidence REAL,
+  CreatedUtc TEXT NOT NULL,
+  ReceivedUtc TEXT,
+  Source TEXT NOT NULL
+);", transaction: tx);
+
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_FeedbackExamples_ChosenFolder ON FeedbackExamples(ChosenFolder);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_FeedbackExamples_NewEntryId ON FeedbackExamples(NewEntryId);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_FeedbackExamples_InternetMessageId ON FeedbackExamples(InternetMessageId);", transaction: tx);
+
+                SetSchemaVersion(conn, tx, 2);
+                tx.Commit();
+            }
+        }
+
+        private static void Migrate2To3(SQLiteConnection conn)
+        {
+            using (var tx = conn.BeginTransaction())
+            {
+                AppLogger.Info("Applying schema migration 2 -> 3.");
+                NormalizeStoredFolderPaths(conn, tx);
+                SetSchemaVersion(conn, tx, 3);
+                tx.Commit();
+            }
+        }
+
+        private static void AddColumnIfMissing(SQLiteConnection conn, SQLiteTransaction tx, string table, string column, string definition)
+        {
+            if (ColumnExists(conn, table, column)) return;
+            conn.Execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition + ";", transaction: tx);
+        }
+
+        private static bool ColumnExists(SQLiteConnection conn, string table, string column)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "PRAGMA table_info(" + table + ");";
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var name = reader["name"] as string;
+                        if (string.Equals(name, column, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         public async Task UpsertEmailAsync(
             string entryId,
             string folder,
@@ -92,50 +275,52 @@ namespace OutlookClassifierAddIn5.Data
 
                 using (var tx = conn.BeginTransaction())
                 {
-                    // Body can be very large; avoid unnecessary overwrites
+                    var normalizedFolder = FolderPathNormalizer.Normalize(folder);
+                    var normalizedSubjectHash = OutlookMailSnapshotService.NormalizedSubjectHash(subject);
                     var bodyParam = string.IsNullOrEmpty(body) ? null : body;
 
-                    // Try UPDATE first
                     var updated = await conn.ExecuteAsync(@"
-                    UPDATE Emails
-                       SET Folder         = @Folder,
-                           Subject        = COALESCE(@Subject, Subject),
-                           Body           = COALESCE(@Body, Body),
-                           FromAddress    = COALESCE(@FromAddress, FromAddress),
-                           SenderDomain   = COALESCE(@SenderDomain, SenderDomain),
-                           HasAttachments = COALESCE(@HasAttachments, HasAttachments),
-                           ReceivedUtc    = COALESCE(@ReceivedUtc, ReceivedUtc)
-                     WHERE EntryId        = @EntryId;",
+UPDATE Emails
+   SET Folder                = @Folder,
+       Subject               = COALESCE(@Subject, Subject),
+       Body                  = COALESCE(@Body, Body),
+       FromAddress           = COALESCE(@FromAddress, FromAddress),
+       SenderDomain          = COALESCE(@SenderDomain, SenderDomain),
+       HasAttachments        = COALESCE(@HasAttachments, HasAttachments),
+       ReceivedUtc           = COALESCE(@ReceivedUtc, ReceivedUtc),
+       NormalizedSubjectHash = COALESCE(@NormalizedSubjectHash, NormalizedSubjectHash)
+ WHERE EntryId               = @EntryId;",
                         new
                         {
-                            EntryId = entryId,
-                            Folder = folder,
-                            Subject = subject,
+                            EntryId = entryId ?? string.Empty,
+                            Folder = normalizedFolder,
+                            Subject = subject ?? string.Empty,
                             Body = bodyParam,
-                            FromAddress = fromAddr,
-                            SenderDomain = domain,
+                            FromAddress = fromAddr ?? string.Empty,
+                            SenderDomain = string.IsNullOrWhiteSpace(domain) ? SenderResolutionService.ExtractDomain(fromAddr) : domain,
                             HasAttachments = hasAtt ? 1 : 0,
-                            ReceivedUtc = receivedUtc.ToString("o")
+                            ReceivedUtc = receivedUtc.ToString("o"),
+                            NormalizedSubjectHash = normalizedSubjectHash
                         }, tx);
 
-                    // Insert if not present
                     if (updated == 0)
                     {
                         await conn.ExecuteAsync(@"
-                        INSERT INTO Emails
-                          (EntryId, Folder, Subject, Body, FromAddress, SenderDomain, HasAttachments, ReceivedUtc)
-                        VALUES
-                          (@EntryId, @Folder, @Subject, @Body, @FromAddress, @SenderDomain, @HasAttachments, @ReceivedUtc);",
+INSERT INTO Emails
+  (EntryId, Folder, Subject, Body, FromAddress, SenderDomain, HasAttachments, ReceivedUtc, NormalizedSubjectHash)
+VALUES
+  (@EntryId, @Folder, @Subject, @Body, @FromAddress, @SenderDomain, @HasAttachments, @ReceivedUtc, @NormalizedSubjectHash);",
                             new
                             {
-                                EntryId = entryId,
-                                Folder = folder,
-                                Subject = subject,
+                                EntryId = entryId ?? string.Empty,
+                                Folder = normalizedFolder,
+                                Subject = subject ?? string.Empty,
                                 Body = bodyParam,
-                                FromAddress = fromAddr,
-                                SenderDomain = domain,
+                                FromAddress = fromAddr ?? string.Empty,
+                                SenderDomain = string.IsNullOrWhiteSpace(domain) ? SenderResolutionService.ExtractDomain(fromAddr) : domain,
                                 HasAttachments = hasAtt ? 1 : 0,
-                                ReceivedUtc = receivedUtc.ToString("o")
+                                ReceivedUtc = receivedUtc.ToString("o"),
+                                NormalizedSubjectHash = normalizedSubjectHash
                             }, tx);
                     }
 
@@ -144,62 +329,109 @@ namespace OutlookClassifierAddIn5.Data
             }
         }
 
-        // Legacy/basic loader (no filters) — kept for compatibility
         public async Task<IEnumerable<EmailRow>> LoadTrainingRowsAsync()
+        {
+            var rows = await LoadTrainingExamplesAsync(null, false);
+            return rows.Select(ToEmailRow).ToList();
+        }
+
+        public async Task<IEnumerable<EmailRow>> LoadTrainingRowsAsync(int? recentDays = 180, bool excludeDeletedItems = true)
+        {
+            var rows = await LoadTrainingExamplesAsync(recentDays, excludeDeletedItems);
+            return rows.Select(ToEmailRow).ToList();
+        }
+
+        public async Task<List<TrainingExample>> LoadTrainingExamplesAsync(int? recentDays = 180, bool excludeSystemFolders = true)
         {
             using (var conn = new SQLiteConnection(_connStr))
             {
                 await conn.OpenAsync();
-                return await conn.QueryAsync<EmailRow>(@"
-                    SELECT
-                      IFNULL(Subject,'')         AS Subject,
-                      IFNULL(Body,'')            AS Body,
-                      IFNULL(FromAddress,'')     AS FromAddress,
-                      IFNULL(SenderDomain,'')    AS SenderDomain,
-                      COALESCE(HasAttachments,0) AS HasAttachments,
-                      Folder                     AS Label
-                    FROM Emails");
+
+                var cutoff = recentDays.HasValue && recentDays.Value > 0
+                    ? DateTime.UtcNow.AddDays(-recentDays.Value).ToString("o")
+                    : null;
+
+                var emailSql = @"
+SELECT
+  IFNULL(Subject,'') AS Subject,
+  IFNULL(Body,'') AS Body,
+  IFNULL(FromAddress,'') AS FromAddress,
+  IFNULL(SenderDomain,'') AS SenderDomain,
+  COALESCE(HasAttachments,0) AS HasAttachments,
+  IFNULL(Folder,'') AS Label,
+  ReceivedUtc AS ReceivedUtcText,
+  'Emails' AS Source
+FROM Emails
+WHERE Folder IS NOT NULL
+  AND (@Cutoff IS NULL OR ReceivedUtc IS NULL OR ReceivedUtc >= @Cutoff);";
+
+                var feedbackSql = @"
+SELECT
+  IFNULL(Subject,'') AS Subject,
+  IFNULL(Body,'') AS Body,
+  IFNULL(FromAddress,'') AS FromAddress,
+  IFNULL(SenderDomain,'') AS SenderDomain,
+  COALESCE(HasAttachments,0) AS HasAttachments,
+  IFNULL(ChosenFolder,'') AS Label,
+  ReceivedUtc AS ReceivedUtcText,
+  IFNULL(Source,'Feedback') AS Source,
+  CreatedUtc AS CreatedUtcText
+FROM FeedbackExamples
+WHERE ChosenFolder IS NOT NULL
+  AND (@Cutoff IS NULL OR ReceivedUtc IS NULL OR ReceivedUtc >= @Cutoff OR CreatedUtc >= @Cutoff);";
+
+                var records = new List<TrainingRecord>();
+                records.AddRange(await conn.QueryAsync<TrainingRecord>(emailSql, new { Cutoff = cutoff }));
+                records.AddRange(await conn.QueryAsync<TrainingRecord>(feedbackSql, new { Cutoff = cutoff }));
+
+                var examples = new List<TrainingExample>();
+                foreach (var record in records)
+                {
+                    var label = FolderPathNormalizer.Normalize(record.Label);
+                    if (label.Length == 0) continue;
+                    if (excludeSystemFolders && FolderPathNormalizer.IsExcludedSystemFolder(label)) continue;
+
+                    var from = record.FromAddress ?? string.Empty;
+                    var domain = string.IsNullOrWhiteSpace(record.SenderDomain)
+                        ? SenderResolutionService.ExtractDomain(from)
+                        : record.SenderDomain;
+
+                    examples.Add(new TrainingExample
+                    {
+                        Subject = record.Subject ?? string.Empty,
+                        Body = record.Body ?? string.Empty,
+                        FromAddress = from,
+                        SenderDomain = domain,
+                        HasAttachments = record.HasAttachments != 0,
+                        Label = label,
+                        ReceivedUtc = ParseUtc(record.ReceivedUtcText) ?? ParseUtc(record.CreatedUtcText),
+                        Source = record.Source ?? string.Empty
+                    });
+                }
+
+                return examples
+                    .OrderByDescending(r => r.ReceivedUtc.HasValue ? r.ReceivedUtc.Value : DateTime.MinValue)
+                    .ToList();
             }
         }
 
         public async Task LogDecisionAsync(string entryId, string predicted, string chosen, double conf)
         {
-            using (var conn = new SQLiteConnection(_connStr))
+            var decision = new DecisionRecord
             {
-                await conn.OpenAsync();
+                EntryId = entryId ?? string.Empty,
+                OldEntryId = entryId ?? string.Empty,
+                NewEntryId = entryId ?? string.Empty,
+                Predicted = predicted ?? string.Empty,
+                Chosen = chosen ?? string.Empty,
+                Confidence = conf,
+                DecidedUtc = DateTime.UtcNow,
+                Source = "Decision"
+            };
 
-                using (var tx = conn.BeginTransaction())
-                {
-                    await conn.ExecuteAsync(@"
-                        INSERT OR REPLACE INTO Decisions
-                          (EntryId, Predicted, Chosen, Confidence, DecidedUtc)
-                        VALUES
-                          (@EntryId, @Predicted, @Chosen, @Confidence, @DecidedUtc);",
-                        new
-                        {
-                            EntryId = entryId,
-                            Predicted = predicted,
-                            Chosen = chosen,
-                            Confidence = conf,
-                            DecidedUtc = DateTime.UtcNow.ToString("o")
-                        }, tx);
-
-                    // Optionally keep Emails.Folder aligned with Chosen
-                    if (!string.IsNullOrWhiteSpace(chosen))
-                    {
-                        await conn.ExecuteAsync(
-                            "UPDATE Emails SET Folder = @Chosen WHERE EntryId = @EntryId;",
-                            new { Chosen = chosen, EntryId = entryId }, tx);
-                    }
-
-                    tx.Commit();
-                }
-            }
+            await RecordApprovalsAsync(null, new[] { decision }, CancellationToken.None);
         }
 
-        // --------------------------------------------------------------------
-        // Batched APIs used by ScanService
-        // --------------------------------------------------------------------
         public Task UpsertEmailsAsync(IEnumerable<ScanService.SeedRow> rows, CancellationToken ct)
         {
             return Task.Run(() =>
@@ -211,66 +443,55 @@ namespace OutlookClassifierAddIn5.Data
                     using (var update = conn.CreateCommand())
                     using (var insert = conn.CreateCommand())
                     {
+                        update.Transaction = tx;
+                        insert.Transaction = tx;
+
                         update.CommandText = @"
 UPDATE Emails
-   SET Folder         = @Folder,
-       Subject        = COALESCE(@Subject, Subject),
-       Body           = COALESCE(@Body, Body),
-       FromAddress    = COALESCE(@FromAddress, FromAddress),
-       SenderDomain   = COALESCE(@SenderDomain, SenderDomain),
-       HasAttachments = COALESCE(@HasAttachments, HasAttachments),
-       ReceivedUtc    = COALESCE(@ReceivedUtc, ReceivedUtc)
- WHERE EntryId        = @EntryId;";
+   SET StoreId               = COALESCE(@StoreId, StoreId),
+       InternetMessageId     = COALESCE(@InternetMessageId, InternetMessageId),
+       ConversationId        = COALESCE(@ConversationId, ConversationId),
+       NormalizedSubjectHash = COALESCE(@NormalizedSubjectHash, NormalizedSubjectHash),
+       Folder                = @Folder,
+       Subject               = COALESCE(@Subject, Subject),
+       Body                  = COALESCE(@Body, Body),
+       FromAddress           = COALESCE(@FromAddress, FromAddress),
+       SenderDomain          = COALESCE(@SenderDomain, SenderDomain),
+       HasAttachments        = COALESCE(@HasAttachments, HasAttachments),
+       ReceivedUtc           = COALESCE(@ReceivedUtc, ReceivedUtc)
+ WHERE EntryId               = @EntryId;";
 
                         insert.CommandText = @"
 INSERT INTO Emails
-  (EntryId, Folder, Subject, Body, FromAddress, SenderDomain, HasAttachments, ReceivedUtc)
+  (EntryId, StoreId, InternetMessageId, ConversationId, NormalizedSubjectHash, Folder, Subject, Body, FromAddress, SenderDomain, HasAttachments, ReceivedUtc)
 VALUES
-  (@EntryId, @Folder, @Subject, @Body, @FromAddress, @SenderDomain, @HasAttachments, @ReceivedUtc);";
+  (@EntryId, @StoreId, @InternetMessageId, @ConversationId, @NormalizedSubjectHash, @Folder, @Subject, @Body, @FromAddress, @SenderDomain, @HasAttachments, @ReceivedUtc);";
 
-                        var u_id = update.CreateParameter(); u_id.ParameterName = "@EntryId"; update.Parameters.Add(u_id);
-                        var u_fld = update.CreateParameter(); u_fld.ParameterName = "@Folder"; update.Parameters.Add(u_fld);
-                        var u_sub = update.CreateParameter(); u_sub.ParameterName = "@Subject"; update.Parameters.Add(u_sub);
-                        var u_bdy = update.CreateParameter(); u_bdy.ParameterName = "@Body"; update.Parameters.Add(u_bdy);
-                        var u_frm = update.CreateParameter(); u_frm.ParameterName = "@FromAddress"; update.Parameters.Add(u_frm);
-                        var u_dom = update.CreateParameter(); u_dom.ParameterName = "@SenderDomain"; update.Parameters.Add(u_dom);
-                        var u_ha = update.CreateParameter(); u_ha.ParameterName = "@HasAttachments"; update.Parameters.Add(u_ha);
-                        var u_rtc = update.CreateParameter(); u_rtc.ParameterName = "@ReceivedUtc"; update.Parameters.Add(u_rtc);
+                        AddParameters(update, "@EntryId", "@StoreId", "@InternetMessageId", "@ConversationId", "@NormalizedSubjectHash", "@Folder", "@Subject", "@Body", "@FromAddress", "@SenderDomain", "@HasAttachments", "@ReceivedUtc");
+                        AddParameters(insert, "@EntryId", "@StoreId", "@InternetMessageId", "@ConversationId", "@NormalizedSubjectHash", "@Folder", "@Subject", "@Body", "@FromAddress", "@SenderDomain", "@HasAttachments", "@ReceivedUtc");
 
-                        var i_id = insert.CreateParameter(); i_id.ParameterName = "@EntryId"; insert.Parameters.Add(i_id);
-                        var i_fld = insert.CreateParameter(); i_fld.ParameterName = "@Folder"; insert.Parameters.Add(i_fld);
-                        var i_sub = insert.CreateParameter(); i_sub.ParameterName = "@Subject"; insert.Parameters.Add(i_sub);
-                        var i_bdy = insert.CreateParameter(); i_bdy.ParameterName = "@Body"; insert.Parameters.Add(i_bdy);
-                        var i_frm = insert.CreateParameter(); i_frm.ParameterName = "@FromAddress"; insert.Parameters.Add(i_frm);
-                        var i_dom = insert.CreateParameter(); i_dom.ParameterName = "@SenderDomain"; insert.Parameters.Add(i_dom);
-                        var i_ha = insert.CreateParameter(); i_ha.ParameterName = "@HasAttachments"; insert.Parameters.Add(i_ha);
-                        var i_rtc = insert.CreateParameter(); i_rtc.ParameterName = "@ReceivedUtc"; insert.Parameters.Add(i_rtc);
-
-                        foreach (var r in rows)
+                        foreach (var r in rows ?? Enumerable.Empty<ScanService.SeedRow>())
                         {
                             ct.ThrowIfCancellationRequested();
 
                             var entryId = r.EntryId ?? string.Empty;
-                            var folder = r.FolderPath ?? string.Empty;   // <-- was r.Folder
+                            var folder = FolderPathNormalizer.Normalize(r.FolderPath);
                             var subject = r.Subject ?? string.Empty;
-                            object body = string.IsNullOrEmpty(r.Body) ? (object)DBNull.Value : r.Body;
-                            var from = r.Sender ?? string.Empty;       // <-- was r.FromAddress
-                            var domain = r.Domain ?? string.Empty;
-                            var ha = r.HasAttachments ? 1 : 0;
-                            var rutc = r.ReceivedUtc.ToString("o");
+                            var from = r.Sender ?? string.Empty;
+                            var domain = string.IsNullOrWhiteSpace(r.Domain) ? SenderResolutionService.ExtractDomain(from) : r.Domain;
 
-                            u_id.Value = entryId; u_fld.Value = folder; u_sub.Value = subject;
-                            u_bdy.Value = body; u_frm.Value = from; u_dom.Value = domain;
-                            u_ha.Value = ha; u_rtc.Value = rutc;
+                            SetParameterValues(update, entryId, r.StoreId, r.InternetMessageId, r.ConversationId,
+                                OutlookMailSnapshotService.NormalizedSubjectHash(subject), folder, subject,
+                                string.IsNullOrEmpty(r.Body) ? (object)DBNull.Value : r.Body, from, domain,
+                                r.HasAttachments ? 1 : 0, r.ReceivedUtc.ToString("o"));
 
                             var updated = update.ExecuteNonQuery();
                             if (updated == 0)
                             {
-                                i_id.Value = entryId; i_fld.Value = folder; i_sub.Value = subject;
-                                i_bdy.Value = (body is DBNull) ? (object)DBNull.Value : body;
-                                i_frm.Value = from; i_dom.Value = domain;
-                                i_ha.Value = ha; i_rtc.Value = rutc;
-
+                                SetParameterValues(insert, entryId, r.StoreId, r.InternetMessageId, r.ConversationId,
+                                    OutlookMailSnapshotService.NormalizedSubjectHash(subject), folder, subject,
+                                    string.IsNullOrEmpty(r.Body) ? (object)DBNull.Value : r.Body, from, domain,
+                                    r.HasAttachments ? 1 : 0, r.ReceivedUtc.ToString("o"));
                                 insert.ExecuteNonQuery();
                             }
                         }
@@ -291,6 +512,7 @@ VALUES
                     using (var tx = conn.BeginTransaction())
                     using (var cmd = conn.CreateCommand())
                     {
+                        cmd.Transaction = tx;
                         cmd.CommandText = @"
 UPDATE Emails
    SET Body = COALESCE(@Body, Body)
@@ -299,11 +521,11 @@ UPDATE Emails
                         var pId = cmd.CreateParameter(); pId.ParameterName = "@EntryId"; cmd.Parameters.Add(pId);
                         var pBody = cmd.CreateParameter(); pBody.ParameterName = "@Body"; cmd.Parameters.Add(pBody);
 
-                        foreach (var b in bodies)
+                        foreach (var b in bodies ?? Enumerable.Empty<ScanService.SeedBody>())
                         {
                             ct.ThrowIfCancellationRequested();
                             pId.Value = b.EntryId ?? string.Empty;
-                            pBody.Value = (object)(b.Body ?? string.Empty) ?? DBNull.Value;
+                            pBody.Value = string.IsNullOrEmpty(b.Body) ? (object)DBNull.Value : b.Body;
                             cmd.ExecuteNonQuery();
                         }
 
@@ -313,89 +535,76 @@ UPDATE Emails
             }, ct);
         }
 
-        // --------------------------------------------------------------------
-        // Training data loader with hygiene controls
-        // --------------------------------------------------------------------
-        public async Task<IEnumerable<EmailRow>> LoadTrainingRowsAsync(int? recentDays = 180, bool excludeDeletedItems = true)
+        public Task RecordApprovalAsync(FeedbackExample feedback, DecisionRecord decision, CancellationToken ct)
         {
-            using (var conn = new SQLiteConnection(_connStr))
-            {
-                await conn.OpenAsync();
-
-                var whereClauses = new List<string>();
-
-                if (excludeDeletedItems)
-                {
-                    whereClauses.Add(@"(
-                        LOWER(Folder) NOT LIKE '%deleted items%' AND 
-                        LOWER(Folder) != 'deleted items'
-                    )");
-                }
-
-                // Always exclude Inbox root and common system folders
-                whereClauses.Add(@"(
-                    LOWER(Folder) != 'inbox' AND
-                    LOWER(Folder) NOT LIKE '%/inbox' AND
-                    LOWER(Folder) NOT LIKE '%sent items%' AND 
-                    LOWER(Folder) != 'sent items' AND
-                    LOWER(Folder) NOT LIKE '%outbox%' AND 
-                    LOWER(Folder) != 'outbox' AND
-                    LOWER(Folder) NOT LIKE '%drafts%' AND 
-                    LOWER(Folder) != 'drafts' AND
-                    LOWER(Folder) NOT LIKE '%junk%' AND
-                    LOWER(Folder) NOT LIKE '%calendar%' AND
-                    LOWER(Folder) NOT LIKE '%contacts%' AND
-                    LOWER(Folder) NOT LIKE '%tasks%' AND
-                    LOWER(Folder) NOT LIKE '%notes%' AND
-                    LOWER(Folder) NOT LIKE '%journal%'
-                )");
-
-                if (recentDays.HasValue && recentDays.Value > 0)
-                {
-                    var cutoff = DateTime.UtcNow.AddDays(-recentDays.Value).ToString("o");
-                    whereClauses.Add($"(ReceivedUtc IS NULL OR ReceivedUtc >= '{cutoff}')");
-                }
-
-                var whereClause = whereClauses.Count > 0
-                    ? ("WHERE " + string.Join(" AND ", whereClauses))
-                    : string.Empty;
-
-                var sql = $@"
-                    SELECT
-                        IFNULL(Subject,'')         AS Subject,
-                        IFNULL(Body,'')            AS Body,
-                        IFNULL(FromAddress,'')     AS FromAddress,
-                        IFNULL(SenderDomain,'')    AS SenderDomain,
-                        COALESCE(HasAttachments,0) AS HasAttachments,
-                        Folder                     AS Label
-                    FROM Emails
-                    {whereClause}
-                    ORDER BY ReceivedUtc DESC";
-
-                return await conn.QueryAsync<EmailRow>(sql);
-            }
+            return RecordApprovalsAsync(
+                feedback == null ? null : new[] { feedback },
+                decision == null ? null : new[] { decision },
+                ct);
         }
 
-        // --------------------------------------------------------------------
-        // Cleanups & metadata
-        // --------------------------------------------------------------------
+        public Task RecordApprovalsAsync(IEnumerable<FeedbackExample> feedbackExamples, IEnumerable<DecisionRecord> decisions, CancellationToken ct)
+        {
+            return Task.Run(() =>
+            {
+                using (var conn = new SQLiteConnection(_connStr))
+                {
+                    conn.Open();
+                    using (var tx = conn.BeginTransaction())
+                    {
+                        foreach (var decision in decisions ?? Enumerable.Empty<DecisionRecord>())
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            var chosen = FolderPathNormalizer.Normalize(decision.Chosen);
+                            var predicted = FolderPathNormalizer.Normalize(decision.Predicted);
+                            var newId = decision.NewEntryId ?? decision.EntryId ?? string.Empty;
+                            var oldId = decision.OldEntryId ?? decision.EntryId ?? string.Empty;
+
+                            conn.Execute(@"
+INSERT OR REPLACE INTO Decisions
+  (EntryId, OldEntryId, NewEntryId, StoreId, Predicted, Chosen, Confidence, DecidedUtc, Source)
+VALUES
+  (@EntryId, @OldEntryId, @NewEntryId, @StoreId, @Predicted, @Chosen, @Confidence, @DecidedUtc, @Source);",
+                                new
+                                {
+                                    EntryId = string.IsNullOrEmpty(newId) ? oldId : newId,
+                                    OldEntryId = oldId,
+                                    NewEntryId = newId,
+                                    StoreId = decision.StoreId ?? string.Empty,
+                                    Predicted = predicted,
+                                    Chosen = chosen,
+                                    Confidence = decision.Confidence,
+                                    DecidedUtc = (decision.DecidedUtc == default(DateTime) ? DateTime.UtcNow : decision.DecidedUtc).ToString("o"),
+                                    Source = decision.Source ?? "Decision"
+                                }, tx);
+
+                            if (!string.IsNullOrWhiteSpace(chosen))
+                            {
+                                conn.Execute("UPDATE Emails SET Folder = @Chosen WHERE EntryId = @EntryId;",
+                                    new { Chosen = chosen, EntryId = newId }, tx);
+                                if (!string.Equals(oldId, newId, StringComparison.Ordinal))
+                                {
+                                    conn.Execute("UPDATE Emails SET Folder = @Chosen WHERE EntryId = @EntryId;",
+                                        new { Chosen = chosen, EntryId = oldId }, tx);
+                                }
+                            }
+                        }
+
+                        foreach (var feedback in feedbackExamples ?? Enumerable.Empty<FeedbackExample>())
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            InsertFeedbackExample(conn, tx, feedback);
+                        }
+
+                        tx.Commit();
+                    }
+                }
+            }, ct);
+        }
+
         public async Task<int> CleanupDeletedItemsAsync()
         {
-            using (var conn = new SQLiteConnection(_connStr))
-            {
-                await conn.OpenAsync();
-
-                using (var tx = conn.BeginTransaction())
-                {
-                    var deletedCount = await conn.ExecuteAsync(@"
-                        DELETE FROM Emails 
-                        WHERE LOWER(Folder) LIKE '%deleted items%' 
-                           OR LOWER(Folder) = 'deleted items'", transaction: tx);
-
-                    tx.Commit();
-                    return deletedCount;
-                }
-            }
+            return await CleanupSystemFoldersAsync();
         }
 
         public async Task<string> GetMetaValueAsync(string key)
@@ -416,7 +625,7 @@ UPDATE Emails
                 await conn.OpenAsync();
                 await conn.ExecuteAsync(
                     "INSERT OR REPLACE INTO Meta (Key, Value) VALUES (@Key, @Value)",
-                    new { Key = key, Value = value });
+                    new { Key = key, Value = value ?? string.Empty });
             }
         }
 
@@ -425,50 +634,22 @@ UPDATE Emails
             using (var conn = new SQLiteConnection(_connStr))
             {
                 await conn.OpenAsync();
-
                 using (var tx = conn.BeginTransaction())
                 {
-                    var deletedCount = await conn.ExecuteAsync(@"
-                        DELETE FROM Emails 
-                        WHERE LOWER(Folder) != 'inbox' AND (
-                           LOWER(Folder) LIKE '%/inbox' OR
-                           LOWER(Folder) LIKE '%sent items%' OR
-                           LOWER(Folder) = 'sent items' OR
-                           LOWER(Folder) LIKE '%outbox%' OR
-                           LOWER(Folder) = 'outbox' OR
-                           LOWER(Folder) LIKE '%drafts%' OR
-                           LOWER(Folder) = 'drafts' OR
-                           LOWER(Folder) LIKE '%junk%' OR
-                           LOWER(Folder) LIKE '%calendar%' OR
-                           LOWER(Folder) LIKE '%contacts%' OR
-                           LOWER(Folder) LIKE '%tasks%' OR
-                           LOWER(Folder) LIKE '%notes%' OR
-                           LOWER(Folder) LIKE '%journal%')", transaction: tx);
-
+                    var deleted = DeleteSystemLabels(conn, tx, "Emails", "EntryId", "Folder");
+                    deleted += DeleteSystemLabels(conn, tx, "FeedbackExamples", "Id", "ChosenFolder");
                     tx.Commit();
-                    return deletedCount;
+                    return deleted;
                 }
             }
         }
 
-        /// <summary>
-        /// Purge training rows whose Folder no longer exists in Outlook.
-        /// Pass the current verified set of Outlook folder paths (case-insensitive).
-        /// </summary>
         public async Task<int> CleanupNonexistentFoldersAsync(IEnumerable<string> validFolderPaths)
         {
-            if (validFolderPaths == null) return 0;
+            var paths = new HashSet<string>(
+                FolderPathNormalizer.NormalizeMany(validFolderPaths),
+                StringComparer.OrdinalIgnoreCase);
 
-            // Normalize & dedupe
-            var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var p in validFolderPaths)
-            {
-                if (!string.IsNullOrWhiteSpace(p))
-                {
-                    var trimmed = p.Trim();
-                    if (trimmed.Length > 0) paths.Add(trimmed);
-                }
-            }
             if (paths.Count == 0) return 0;
 
             using (var conn = new SQLiteConnection(_connStr))
@@ -476,54 +657,8 @@ UPDATE Emails
                 await conn.OpenAsync();
                 using (var tx = conn.BeginTransaction())
                 {
-                    // Temp table to hold the valid set
-                    using (var drop = conn.CreateCommand())
-                    {
-                        drop.Transaction = tx;
-                        drop.CommandText = "DROP TABLE IF EXISTS ValidFolders;";
-                        drop.ExecuteNonQuery();
-                    }
-
-                    using (var create = conn.CreateCommand())
-                    {
-                        create.Transaction = tx;
-                        create.CommandText = "CREATE TEMP TABLE ValidFolders(Path TEXT PRIMARY KEY);";
-                        create.ExecuteNonQuery();
-                    }
-
-                    using (var insert = conn.CreateCommand())
-                    {
-                        insert.Transaction = tx;
-                        insert.CommandText = "INSERT OR IGNORE INTO ValidFolders(Path) VALUES (@p);";
-                        var pp = insert.CreateParameter();
-                        pp.ParameterName = "@p";
-                        insert.Parameters.Add(pp);
-
-                        foreach (var path in paths)
-                        {
-                            pp.Value = path;
-                            insert.ExecuteNonQuery();
-                        }
-                    }
-
-                    // Case-insensitive comparison via LOWER(...)
-                    var deleted = await conn.ExecuteAsync(
-                        @"DELETE FROM Emails
-                          WHERE Folder IS NOT NULL
-                            AND LOWER(Folder) NOT IN (SELECT LOWER(Path) FROM ValidFolders);",
-                        transaction: tx);
-
-                    try
-                    {
-                        using (var drop2 = conn.CreateCommand())
-                        {
-                            drop2.Transaction = tx;
-                            drop2.CommandText = "DROP TABLE IF EXISTS ValidFolders;";
-                            drop2.ExecuteNonQuery();
-                        }
-                    }
-                    catch { /* non-fatal */ }
-
+                    var deleted = DeleteLabelsNotInSet(conn, tx, "Emails", "EntryId", "Folder", paths);
+                    deleted += DeleteLabelsNotInSet(conn, tx, "FeedbackExamples", "Id", "ChosenFolder", paths);
                     tx.Commit();
                     return deleted;
                 }
@@ -532,54 +667,277 @@ UPDATE Emails
 
         public async Task<int> NormalizeFolderLabelsAsync(IEnumerable<string> validFullPaths)
         {
-            if (validFullPaths == null) return 0;
-            var fulls = new List<string>(validFullPaths);
-            var lookup = fulls
-                .GroupBy(p => p.Split('/').Last(), StringComparer.OrdinalIgnoreCase)
+            var normalizedFullPaths = FolderPathNormalizer.NormalizeMany(validFullPaths).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var lookup = normalizedFullPaths
+                .GroupBy(FolderPathNormalizer.Leaf, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
 
-            using (var conn = new System.Data.SQLite.SQLiteConnection(_connStr))
+            using (var conn = new SQLiteConnection(_connStr))
             {
                 await conn.OpenAsync();
                 using (var tx = conn.BeginTransaction())
                 {
-                    // 1) Update unambiguous leaf-only rows to their unique full path
-                    // (we’ll do this row-by-row in C# for clarity)
-                    var rows = await conn.QueryAsync<(string EntryId, string Folder)>(
-                        "SELECT EntryId, Folder FROM Emails WHERE Folder NOT LIKE '%/%';",
-                        transaction: tx);
-
-                    int updated = 0, deleted = 0;
-                    foreach (var row in rows)
-                    {
-                        var leaf = row.Folder?.Trim();
-                        if (string.IsNullOrEmpty(leaf)) continue;
-
-                        if (lookup.TryGetValue(leaf, out var candidates) && candidates.Count == 1)
-                        {
-                            // Unambiguous -> update to full path
-                            await conn.ExecuteAsync(
-                                "UPDATE Emails SET Folder = @Full WHERE EntryId = @Id;",
-                                new { Full = candidates[0], Id = row.EntryId }, tx);
-                            updated++;
-                        }
-                        else
-                        {
-                            // Ambiguous or unknown -> remove to avoid polluting labels
-                            await conn.ExecuteAsync(
-                                "DELETE FROM Emails WHERE EntryId = @Id;", new { Id = row.EntryId }, tx);
-                            deleted++;
-                        }
-                    }
-
-                    // 2) Normalize backslashes to forward slashes
-                    await conn.ExecuteAsync(
-                        "UPDATE Emails SET Folder = REPLACE(Folder, '\\\\', '/');", transaction: tx);
-
+                    var changed = 0;
+                    changed += NormalizeLabelColumn(conn, tx, "Emails", "EntryId", "Folder", lookup);
+                    changed += NormalizeLabelColumn(conn, tx, "FeedbackExamples", "Id", "ChosenFolder", lookup);
+                    changed += NormalizeLabelColumn(conn, tx, "FeedbackExamples", "Id", "PredictedFolder", lookup);
+                    changed += NormalizeLabelColumn(conn, tx, "Decisions", "EntryId", "Predicted", lookup);
+                    changed += NormalizeLabelColumn(conn, tx, "Decisions", "EntryId", "Chosen", lookup);
                     tx.Commit();
-                    return updated + deleted;
+                    return changed;
                 }
             }
+        }
+
+        public async Task<int> ClearTrainingDatabaseAsync()
+        {
+            using (var conn = new SQLiteConnection(_connStr))
+            {
+                await conn.OpenAsync();
+                using (var tx = conn.BeginTransaction())
+                {
+                    var count = await conn.ExecuteAsync("DELETE FROM Emails;", transaction: tx);
+                    count += await conn.ExecuteAsync("DELETE FROM FeedbackExamples;", transaction: tx);
+                    tx.Commit();
+                    AppLogger.Warn("Training database cleared by user action.");
+                    return count;
+                }
+            }
+        }
+
+        public async Task<int> ClearDecisionAndFeedbackHistoryAsync()
+        {
+            using (var conn = new SQLiteConnection(_connStr))
+            {
+                await conn.OpenAsync();
+                using (var tx = conn.BeginTransaction())
+                {
+                    var count = await conn.ExecuteAsync("DELETE FROM Decisions;", transaction: tx);
+                    count += await conn.ExecuteAsync("DELETE FROM FeedbackExamples;", transaction: tx);
+                    tx.Commit();
+                    AppLogger.Warn("Decision and feedback history cleared by user action.");
+                    return count;
+                }
+            }
+        }
+
+        public async Task<int> GetBodySnippetLengthAsync()
+        {
+            var value = await GetMetaValueAsync("BodySnippetLength");
+            int length;
+            return int.TryParse(value, out length) && length >= 0 ? length : DefaultBodySnippetLength;
+        }
+
+        public Task SetBodySnippetLengthAsync(int length)
+        {
+            if (length < 0) length = 0;
+            if (length > 5000) length = 5000;
+            return SetMetaValueAsync("BodySnippetLength", length.ToString());
+        }
+
+        public async Task<string> ExportDiagnosticsAsync(string targetPath)
+        {
+            if (string.IsNullOrWhiteSpace(targetPath))
+                targetPath = Path.Combine(AppLogger.DataDirectory, "diagnostics-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + ".json");
+
+            using (var conn = new SQLiteConnection(_connStr))
+            {
+                await conn.OpenAsync();
+                var diagnostics = new
+                {
+                    ExportedUtc = DateTime.UtcNow.ToString("o"),
+                    DataFolder = AppLogger.DataDirectory,
+                    SchemaVersion = await conn.ExecuteScalarAsync<string>("SELECT Value FROM Meta WHERE Key = 'SchemaVersion';"),
+                    EmailRows = await conn.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM Emails;"),
+                    FeedbackRows = await conn.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM FeedbackExamples;"),
+                    DecisionRows = await conn.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM Decisions;"),
+                    LabelCount = await conn.ExecuteScalarAsync<int>("SELECT COUNT(DISTINCT Folder) FROM Emails WHERE Folder IS NOT NULL;"),
+                    FeedbackLabelCount = await conn.ExecuteScalarAsync<int>("SELECT COUNT(DISTINCT ChosenFolder) FROM FeedbackExamples WHERE ChosenFolder IS NOT NULL;")
+                };
+
+                File.WriteAllText(targetPath, JsonConvert.SerializeObject(diagnostics, Formatting.Indented));
+                return targetPath;
+            }
+        }
+
+        private static void InsertFeedbackExample(SQLiteConnection conn, SQLiteTransaction tx, FeedbackExample feedback)
+        {
+            if (feedback == null) return;
+
+            var chosen = FolderPathNormalizer.Normalize(feedback.ChosenFolder);
+            if (string.IsNullOrEmpty(chosen)) return;
+
+            var predicted = FolderPathNormalizer.Normalize(feedback.PredictedFolder);
+            var subject = feedback.Subject ?? string.Empty;
+            var from = feedback.FromAddress ?? string.Empty;
+            var domain = string.IsNullOrWhiteSpace(feedback.SenderDomain)
+                ? SenderResolutionService.ExtractDomain(from)
+                : feedback.SenderDomain;
+
+            conn.Execute(@"
+INSERT INTO FeedbackExamples
+  (OldEntryId, NewEntryId, StoreId, InternetMessageId, ConversationId, NormalizedSubjectHash, Subject, Body,
+   FromAddress, SenderDomain, HasAttachments, ChosenFolder, PredictedFolder, Confidence, CreatedUtc, ReceivedUtc, Source)
+VALUES
+  (@OldEntryId, @NewEntryId, @StoreId, @InternetMessageId, @ConversationId, @NormalizedSubjectHash, @Subject, @Body,
+   @FromAddress, @SenderDomain, @HasAttachments, @ChosenFolder, @PredictedFolder, @Confidence, @CreatedUtc, @ReceivedUtc, @Source);",
+                new
+                {
+                    OldEntryId = feedback.OldEntryId ?? string.Empty,
+                    NewEntryId = feedback.NewEntryId ?? string.Empty,
+                    StoreId = feedback.StoreId ?? string.Empty,
+                    InternetMessageId = feedback.InternetMessageId ?? string.Empty,
+                    ConversationId = feedback.ConversationId ?? string.Empty,
+                    NormalizedSubjectHash = OutlookMailSnapshotService.NormalizedSubjectHash(subject),
+                    Subject = subject,
+                    Body = feedback.Body ?? string.Empty,
+                    FromAddress = from,
+                    SenderDomain = domain,
+                    HasAttachments = feedback.HasAttachments ? 1 : 0,
+                    ChosenFolder = chosen,
+                    PredictedFolder = predicted,
+                    Confidence = feedback.Confidence,
+                    CreatedUtc = (feedback.CreatedUtc == default(DateTime) ? DateTime.UtcNow : feedback.CreatedUtc).ToString("o"),
+                    ReceivedUtc = feedback.ReceivedUtc.HasValue ? feedback.ReceivedUtc.Value.ToUniversalTime().ToString("o") : null,
+                    Source = string.IsNullOrWhiteSpace(feedback.Source) ? "Feedback" : feedback.Source
+                }, tx);
+        }
+
+        private static void NormalizeStoredFolderPaths(SQLiteConnection conn, SQLiteTransaction tx)
+        {
+            NormalizeLabelColumn(conn, tx, "Emails", "EntryId", "Folder", null);
+            NormalizeLabelColumn(conn, tx, "FeedbackExamples", "Id", "ChosenFolder", null);
+            NormalizeLabelColumn(conn, tx, "FeedbackExamples", "Id", "PredictedFolder", null);
+            NormalizeLabelColumn(conn, tx, "Decisions", "EntryId", "Predicted", null);
+            NormalizeLabelColumn(conn, tx, "Decisions", "EntryId", "Chosen", null);
+        }
+
+        private static int NormalizeLabelColumn(
+            SQLiteConnection conn,
+            SQLiteTransaction tx,
+            string table,
+            string idColumn,
+            string folderColumn,
+            Dictionary<string, List<string>> leafLookup)
+        {
+            var rows = conn.Query<FolderRecord>(
+                "SELECT " + idColumn + " AS Id, " + folderColumn + " AS Folder FROM " + table + " WHERE " + folderColumn + " IS NOT NULL;",
+                transaction: tx).ToList();
+
+            var changed = 0;
+            foreach (var row in rows)
+            {
+                var normalized = FolderPathNormalizer.Normalize(row.Folder);
+                if (leafLookup != null && normalized.IndexOf('/') < 0)
+                {
+                    List<string> candidates;
+                    if (leafLookup.TryGetValue(normalized, out candidates) && candidates.Count == 1)
+                        normalized = candidates[0];
+                }
+
+                if (!string.Equals(row.Folder ?? string.Empty, normalized, StringComparison.Ordinal))
+                {
+                    conn.Execute(
+                        "UPDATE " + table + " SET " + folderColumn + " = @Folder WHERE " + idColumn + " = @Id;",
+                        new { Folder = normalized, Id = row.Id },
+                        tx);
+                    changed++;
+                }
+            }
+
+            return changed;
+        }
+
+        private static int DeleteSystemLabels(SQLiteConnection conn, SQLiteTransaction tx, string table, string idColumn, string folderColumn)
+        {
+            var rows = conn.Query<FolderRecord>(
+                "SELECT " + idColumn + " AS Id, " + folderColumn + " AS Folder FROM " + table + " WHERE " + folderColumn + " IS NOT NULL;",
+                transaction: tx).ToList();
+
+            var deleted = 0;
+            foreach (var row in rows)
+            {
+                if (!FolderPathNormalizer.IsExcludedSystemFolder(row.Folder)) continue;
+                conn.Execute("DELETE FROM " + table + " WHERE " + idColumn + " = @Id;", new { Id = row.Id }, tx);
+                deleted++;
+            }
+
+            return deleted;
+        }
+
+        private static int DeleteLabelsNotInSet(SQLiteConnection conn, SQLiteTransaction tx, string table, string idColumn, string folderColumn, HashSet<string> validPaths)
+        {
+            var rows = conn.Query<FolderRecord>(
+                "SELECT " + idColumn + " AS Id, " + folderColumn + " AS Folder FROM " + table + " WHERE " + folderColumn + " IS NOT NULL;",
+                transaction: tx).ToList();
+
+            var deleted = 0;
+            foreach (var row in rows)
+            {
+                var normalized = FolderPathNormalizer.Normalize(row.Folder);
+                if (normalized.Length == 0 || validPaths.Contains(normalized)) continue;
+                conn.Execute("DELETE FROM " + table + " WHERE " + idColumn + " = @Id;", new { Id = row.Id }, tx);
+                deleted++;
+            }
+
+            return deleted;
+        }
+
+        private static void AddParameters(SQLiteCommand cmd, params string[] names)
+        {
+            foreach (var name in names)
+            {
+                var p = cmd.CreateParameter();
+                p.ParameterName = name;
+                cmd.Parameters.Add(p);
+            }
+        }
+
+        private static void SetParameterValues(SQLiteCommand cmd, params object[] values)
+        {
+            for (var i = 0; i < values.Length; i++)
+                cmd.Parameters[i].Value = values[i] ?? DBNull.Value;
+        }
+
+        private static EmailRow ToEmailRow(TrainingExample r)
+        {
+            return new EmailRow
+            {
+                Subject = r.Subject ?? string.Empty,
+                Body = r.Body ?? string.Empty,
+                FromAddress = r.FromAddress ?? string.Empty,
+                SenderDomain = r.SenderDomain ?? string.Empty,
+                HasAttachments = r.HasAttachments,
+                Label = FolderPathNormalizer.Normalize(r.Label)
+            };
+        }
+
+        private static DateTime? ParseUtc(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return null;
+            DateTime parsed;
+            if (!DateTime.TryParse(value, null, System.Globalization.DateTimeStyles.RoundtripKind, out parsed))
+                return null;
+            return parsed.Kind == DateTimeKind.Utc ? parsed : parsed.ToUniversalTime();
+        }
+
+        private sealed class TrainingRecord
+        {
+            public string Subject { get; set; }
+            public string Body { get; set; }
+            public string FromAddress { get; set; }
+            public string SenderDomain { get; set; }
+            public int HasAttachments { get; set; }
+            public string Label { get; set; }
+            public string ReceivedUtcText { get; set; }
+            public string CreatedUtcText { get; set; }
+            public string Source { get; set; }
+        }
+
+        private sealed class FolderRecord
+        {
+            public object Id { get; set; }
+            public string Folder { get; set; }
         }
     }
 }
