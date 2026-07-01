@@ -39,6 +39,9 @@ namespace OutlookClassifierAddIn5.UI
         private readonly QueueService _queue;
         private readonly string _modelPath; // ADD THIS LINE
         private readonly OutlookMoveService _moveService;
+        private readonly SemaphoreSlim _trainGate = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim _queueBuildGate = new SemaphoreSlim(1, 1);
+        private int _queueBuildVersion;
 
         // UI
         private TabControl tabs;
@@ -521,29 +524,14 @@ namespace OutlookClassifierAddIn5.UI
 
         private void RefreshFolderList()
         {
-            _mailFolderPathsFull.Clear();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var p in FolderMap.GetAllFolderPaths(_app))
-            {
-                if (IsValidFilingFolder(p))
-                {
-                    try
-                    {
-                        var ns = _app.Session;
-                        var folder = FolderMap.ResolveFolderByPath(p, ns);
-                        var normalized = FolderPathNormalizer.Normalize(p);
-                        if (folder != null && seen.Add(normalized)) // Only add if folder actually exists and not already added
-                            _mailFolderPathsFull.Add(normalized);
-                    }
-                    catch (Exception ex)
-                    {
-                        AppLogger.Warn("Folder skipped during refresh because it could not be resolved: " + p + " " + ex.Message);
-                    }
-                }
-            }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var snapshot = _queue.FolderSnapshot.Refresh(_app, force: false);
+            _mailFolderPathsFull = snapshot.FullPaths.ToList();
 
             var items = BuildFolderItems("");
             _folderList = items;
+            sw.Stop();
+            AppLogger.Info("Folder list refreshed for UI. Paths=" + _mailFolderPathsFull.Count + ", elapsedMs=" + sw.ElapsedMilliseconds + ".");
 
             // UI write: items / dropdown
             UI(() =>
@@ -670,6 +658,7 @@ namespace OutlookClassifierAddIn5.UI
         }
         public void RefreshQueues()
         {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             if (this.InvokeRequired) { this.BeginInvoke((Action)RefreshQueues); return; }
             if (_queue == null) return;
 
@@ -706,6 +695,8 @@ namespace OutlookClassifierAddIn5.UI
             int highCount = _batchItems.Count(x => x.Confidence >= _autoApproveThreshold);
             int medCount = _batchItems.Count - highCount;
             lblStats.Text = $"High: {highCount}  Medium: {medCount}  Excluded: {_excludedEntryIds.Count}  Folders: {_groups.Count}";
+            sw.Stop();
+            AppLogger.Info("Queue UI bind complete. Items=" + _batchItems.Count + ", groups=" + _groups.Count + ", elapsedMs=" + sw.ElapsedMilliseconds + ".");
         }
 
         // ========= SINGLE-VIEW (SELECTION DRIVEN) =========
@@ -1061,31 +1052,51 @@ namespace OutlookClassifierAddIn5.UI
 
         public async System.Threading.Tasks.Task TrainModelAsync(string savePath)
         {
+            if (!await _trainGate.WaitAsync(0))
+            {
+                SetStatus("Training already in progress...");
+                AppLogger.Info("Train request coalesced because training is already running.");
+                return;
+            }
+
             await SafeRun(async () =>
             {
-                SetStatus("Training model...");
-                var rows = await _store.LoadTrainingExamplesAsync(recentDays: ModelService.DefaultRecentDays, excludeSystemFolders: true);
-                if (rows == null || rows.Count == 0)
+                try
                 {
-                    SetStatus("Not enough training data.");
-                    return;
+                    SetStatus("Training model...");
+                    var bodyLength = await _store.GetBodySnippetLengthAsync();
+                    var rows = await _store.LoadTrainingExamplesAsync(
+                        recentDays: ModelService.DefaultRecentDays,
+                        excludeSystemFolders: true,
+                        includeBody: bodyLength > 0);
+
+                    if (rows == null || rows.Count == 0)
+                    {
+                        SetStatus("Not enough training data.");
+                        return;
+                    }
+
+                    var result = await Task.Run(() =>
+                    {
+                        Microsoft.ML.DataViewSchema schema;
+                        return _ml.TrainWithEvaluation(rows, ModelService.DefaultRecentDays, out schema);
+                    });
+
+                    var path = string.IsNullOrWhiteSpace(savePath) ? _modelPath : savePath;
+                    if (!string.IsNullOrEmpty(path))
+                        _ml.Save(path);
+
+                    _queue.InvalidateState();
+                    SetStatus(result == null ? "Training complete." : result.ToStatusSummary());
+
+                    // Re-score the currently selected email, if any
+                    if (!string.IsNullOrEmpty(_currentEntryId))
+                        BeginShowSelectedAsync(_currentEntryId);
                 }
-
-                var result = await Task.Run(() =>
+                finally
                 {
-                    Microsoft.ML.Data.DataViewSchema schema;
-                    return _ml.TrainWithEvaluation(rows, ModelService.DefaultRecentDays, out schema);
-                });
-
-                var path = string.IsNullOrWhiteSpace(savePath) ? _modelPath : savePath;
-                if (!string.IsNullOrEmpty(path))
-                    _ml.Save(path);
-
-                SetStatus(result == null ? "Training complete." : result.ToStatusSummary());
-
-                // Re-score the currently selected email, if any
-                if (!string.IsNullOrEmpty(_currentEntryId))
-                    BeginShowSelectedAsync(_currentEntryId);
+                    _trainGate.Release();
+                }
             });
         }
 
@@ -1428,7 +1439,13 @@ namespace OutlookClassifierAddIn5.UI
                     RemoveFromBatchById(id);
 
                 if (_queue != null)
-                    await _queue.BuildQueuesAsync(_app);
+                    await _queue.BuildQueuesAsync(_app, new QueueBuildOptions
+                    {
+                        DaysBack = 90,
+                        Cap = 500,
+                        IgnoreFlagged = true,
+                        UseIncremental = true
+                    }, CancellationToken.None);
 
                 UI(() => RefreshQueues());
                 SetStatus("Approved " + moved + " item(s).");
@@ -1458,29 +1475,10 @@ namespace OutlookClassifierAddIn5.UI
         {
             try
             {
-                // Clear cached folder list to force refresh from current Outlook state
-                _mailFolderPathsFull.Clear();
-                
-                // Rebuild from current Outlook folder structure
-                foreach (var p in FolderMap.GetAllFolderPaths(_app))
-                {
-                    // Only include valid filing folders (this will exclude system folders and non-existent ones)
-                    if (IsValidFilingFolder(p))
-                    {
-                        // Verify folder still exists before adding
-                        try
-                        {
-                            var ns = _app.Session;
-                            var folder = FolderMap.ResolveFolderByPath(p, ns);
-                            if (folder != null) // Only add if folder actually exists
-                                _mailFolderPathsFull.Add(FolderPathNormalizer.Normalize(p));
-                        }
-                        catch (Exception ex)
-                        {
-                            AppLogger.Warn("Folder skipped during cache refresh because it could not be resolved: " + p + " " + ex.Message);
-                        }
-                    }
-                }
+                _queue.FolderSnapshot.Invalidate();
+                _queue.InvalidateState();
+                var snapshot = _queue.FolderSnapshot.Refresh(_app, force: true);
+                _mailFolderPathsFull = snapshot.FullPaths.ToList();
 
                 // Refresh the combo box items
                 var items = BuildFolderItems("");
@@ -1499,9 +1497,29 @@ namespace OutlookClassifierAddIn5.UI
         private async Task BuildQueuesAndRefreshAsync()
         {
             if (_queue == null) return;
+            if (!await _queueBuildGate.WaitAsync(0))
+            {
+                AppLogger.Info("Queue build request coalesced because a build is already running.");
+                return;
+            }
+
+            int version = Interlocked.Increment(ref _queueBuildVersion);
             try
             {
-                await _queue.BuildQueuesAsync(_app);
+                await _queue.BuildQueuesAsync(_app, new QueueBuildOptions
+                {
+                    DaysBack = 90,
+                    Cap = 500,
+                    IgnoreFlagged = true,
+                    UseIncremental = true
+                }, CancellationToken.None);
+
+                if (version != _queueBuildVersion)
+                {
+                    AppLogger.Info("Skipping stale queue bind for version " + version + ".");
+                    return;
+                }
+
                 if (this.IsHandleCreated)
                     this.BeginInvoke((Action)(() => RefreshQueues()));
                 else
@@ -1510,6 +1528,10 @@ namespace OutlookClassifierAddIn5.UI
             catch (Exception ex)
             {
                 AppLogger.Error(ex, "Queue build failed during pane refresh.");
+            }
+            finally
+            {
+                _queueBuildGate.Release();
             }
         }
 
@@ -1520,8 +1542,8 @@ namespace OutlookClassifierAddIn5.UI
             {
                 // Build current valid folder set from Outlook, purge stale DB labels
                 var validPaths = new List<string>();
-                foreach (var p in OutlookClassifierAddIn5.Data.FolderMap.GetAllFolderPaths(_app))
-                    validPaths.Add(p);
+                var snapshot = _queue.FolderSnapshot.Refresh(_app, force: true);
+                validPaths.AddRange(snapshot.FullPaths);
 
                 var normalized = await _store.NormalizeFolderLabelsAsync(validPaths);
                 var cleanedSys = await _store.CleanupSystemFoldersAsync();
@@ -1529,7 +1551,14 @@ namespace OutlookClassifierAddIn5.UI
 
                 RefreshFolderCache();
                 await TrainModelAsync(_modelPath);
-                if (_queue != null) await _queue.BuildQueuesAsync(_app);
+                if (_queue != null) await _queue.BuildQueuesAsync(_app, new QueueBuildOptions
+                {
+                    DaysBack = 90,
+                    Cap = 500,
+                    IgnoreFlagged = true,
+                    UseIncremental = true,
+                    ForceFolderRefresh = true
+                }, CancellationToken.None);
                 RefreshQueues();
 
                 MessageBox.Show($"Normalized {normalized} rows; cleaned system: {cleanedSys}.", "Cleanup Complete");
@@ -1568,23 +1597,16 @@ namespace OutlookClassifierAddIn5.UI
             var s = NormalizePath(label);
             if (string.IsNullOrEmpty(s)) return string.Empty;
 
-            // Exact path match?
+            var snapshot = _queue != null ? _queue.FolderSnapshot.Current : null;
+            if (snapshot != null)
+            {
+                var full = snapshot.CanonicalizeToFull(s);
+                if (!string.IsNullOrEmpty(full)) return full;
+            }
+
             var exact = _mailFolderPathsFull.FirstOrDefault(p =>
                 string.Equals(NormalizePath(p), s, StringComparison.OrdinalIgnoreCase));
-            if (!string.IsNullOrEmpty(exact)) return exact;
-
-            // Unique leaf match?
-            var leafMatches = _mailFolderPathsFull.Where(p =>
-                string.Equals(GetLeaf(p), s, StringComparison.OrdinalIgnoreCase)).ToList();
-            if (leafMatches.Count == 1) return leafMatches[0];
-
-            // Unique "display" (without account root)?
-            var dispMatches = _mailFolderPathsFull.Where(p =>
-                string.Equals(StripAccountRoot(p), s, StringComparison.OrdinalIgnoreCase)).ToList();
-            if (dispMatches.Count == 1) return dispMatches[0];
-
-            // Ambiguous or unknown -> don't guess
-            return string.Empty;
+            return exact ?? string.Empty;
         }
 
         private void ClampComboDropDown()

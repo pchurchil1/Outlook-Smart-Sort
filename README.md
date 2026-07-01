@@ -31,3 +31,9 @@ Diagnostic export includes counts and metadata only, not message subject or body
 ## Validation
 
 Build and run the add-in from Visual Studio with Outlook desktop and VSTO installed. Non-Windows SDK builds may fail before C# compilation because `Microsoft.VisualStudio.Tools.Office.targets` is not available outside a VSTO install.
+
+## Large Inbox Behavior
+
+Queue building snapshots Outlook rows first, then scores plain DTOs in a batch. Folder paths are cached in memory for short intervals and refreshed on pane activation or explicit folder refresh. Queue refreshes reuse unchanged scored items by message id, received time, model metadata, and folder snapshot version.
+
+Local logs include timings and row counts for folder snapshots, inbox queue snapshots, batch scoring, queue UI binding, database upserts, training row loads, and model training phases.

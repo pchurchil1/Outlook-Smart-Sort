@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -116,7 +117,10 @@ namespace OutlookClassifierAddIn5.Services
 
         private async Task ScanMailFolderAsync(Outlook.MAPIFolder f, ScanOptions opts, CancellationToken ct)
         {
+            var sw = Stopwatch.StartNew();
             Outlook.Table table = null;
+            int taken = 0;
+            string folderPath = SafeFolderPath(f);
             try
             {
                 var cutoffUtc = DateTime.UtcNow.AddDays(-opts.DaysBack);
@@ -139,8 +143,6 @@ namespace OutlookClassifierAddIn5.Services
                 try { table.Sort("[ReceivedTime]", Outlook.OlSortOrder.olDescending); } catch (Exception ex) { AppLogger.Warn("Scan table sort failed: " + ex.Message); }
 
                 var batch = new List<SeedRow>(Math.Min(opts.CapPerFolder, 500));
-                int taken = 0;
-                string folderPath = SafeFolderPath(f);
                 string storeId = SafeFolderStoreId(f);
 
                 Outlook.Row row;
@@ -197,12 +199,16 @@ namespace OutlookClassifierAddIn5.Services
             finally
             {
                 ReleaseCom(table);
+                sw.Stop();
+                AppLogger.Info("Folder scan complete. Folder=" + folderPath + ", rows=" + taken + ", elapsedMs=" + sw.ElapsedMilliseconds + ".");
             }
         }
 
         private async Task PopulateBodiesForSampleAsync(Outlook.MAPIFolder f, int sampleCount, int bodySnippetLength, CancellationToken ct)
         {
+            var sw = Stopwatch.StartNew();
             Outlook.Items items = null;
+            int count = 0;
             try
             {
                 items = f.Items;
@@ -210,7 +216,6 @@ namespace OutlookClassifierAddIn5.Services
                 items = items.Restrict("[MessageClass] = 'IPM.Note'");
 
                 var toWrite = new List<SeedBody>(sampleCount);
-                int count = 0;
 
                 foreach (object obj in items)
                 {
@@ -235,6 +240,8 @@ namespace OutlookClassifierAddIn5.Services
             finally
             {
                 ReleaseCom(items);
+                sw.Stop();
+                AppLogger.Info("Body sample scan complete. Folder=" + SafeFolderPath(f) + ", rows=" + count + ", elapsedMs=" + sw.ElapsedMilliseconds + ".");
             }
         }
 

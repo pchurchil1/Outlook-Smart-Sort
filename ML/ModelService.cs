@@ -156,7 +156,10 @@ namespace OutlookClassifierAddIn5.ML
         {
             if (examples == null) throw new ArgumentNullException(nameof(examples));
 
+            var totalSw = System.Diagnostics.Stopwatch.StartNew();
+            var prepareSw = System.Diagnostics.Stopwatch.StartNew();
             var prepared = PrepareExamples(examples);
+            prepareSw.Stop();
             var rows = prepared.Select(p => p.Row).ToList();
             var labelCount = rows.Select(r => r.Label).Distinct(StringComparer.OrdinalIgnoreCase).Count();
 
@@ -165,14 +168,18 @@ namespace OutlookClassifierAddIn5.ML
 
             AppLogger.Info("Model train start. Rows=" + rows.Count + ", labels=" + labelCount + ".");
 
+            var evalSw = System.Diagnostics.Stopwatch.StartNew();
             var evaluation = EvaluateIfPossible(prepared);
+            evalSw.Stop();
 
             var data = _ml.Data.LoadFromEnumerable(rows);
             var pipeline = BuildPipeline();
 
             try
             {
+                var fitSw = System.Diagnostics.Stopwatch.StartNew();
                 _model = pipeline.Fit(data);
+                fitSw.Stop();
                 _schema = data.Schema;
                 schema = _schema;
                 BuildEngineAndClassNames();
@@ -202,7 +209,12 @@ namespace OutlookClassifierAddIn5.ML
                 };
 
                 LogEvaluation(evaluation);
-                AppLogger.Info("Model train end. " + LastTrainingResult.ToStatusSummary());
+                totalSw.Stop();
+                AppLogger.Info("Model train end. " + LastTrainingResult.ToStatusSummary() +
+                    ", prepareMs=" + prepareSw.ElapsedMilliseconds +
+                    ", evalMs=" + evalSw.ElapsedMilliseconds +
+                    ", fitMs=" + fitSw.ElapsedMilliseconds +
+                    ", totalMs=" + totalSw.ElapsedMilliseconds + ".");
 
                 return LastTrainingResult;
             }

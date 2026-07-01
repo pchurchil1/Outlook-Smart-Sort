@@ -305,6 +305,7 @@
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="Services\AppLogger.cs" />
+    <Compile Include="Services\FolderSnapshotService.cs" />
     <Compile Include="Services\FolderPathNormalizer.cs" />
     <Compile Include="Services\MailFeatureDto.cs" />
     <Compile Include="Services\OutlookMailSnapshotService.cs" />

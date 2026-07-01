@@ -20,6 +20,8 @@ namespace OutlookClassifierAddIn5
         private bool _visibleChangedHooked;
         private bool _selectionHooked;
         private bool _initialActivationComplete;
+        private readonly SemaphoreSlim _activationGate = new SemaphoreSlim(1, 1);
+        private int _activationVersion;
 
         internal TaskPaneControl PaneControl { get; private set; }
 
@@ -115,11 +117,15 @@ namespace OutlookClassifierAddIn5
         private async void StartPaneActivationAsync()
         {
             CancelQueueBuild("Restarting pane activation.");
+            int version = Interlocked.Increment(ref _activationVersion);
             _queueBuildCts = new CancellationTokenSource();
             var ct = _queueBuildCts.Token;
 
+            await _activationGate.WaitAsync();
             try
             {
+                if (version != _activationVersion) return;
+
                 if (!_initialActivationComplete && !ModelSvc.IsLoaded)
                 {
                     var cleanupVersion = await Store.GetMetaValueAsync("system_folders_cleanup_v1");
@@ -141,6 +147,7 @@ namespace OutlookClassifierAddIn5
                     ct.ThrowIfCancellationRequested();
                     PaneControl.SetStatus("Training model...");
                     await PaneControl.TrainModelAsync(_modelPath);
+                    Queue.InvalidateState();
                     _initialActivationComplete = true;
                 }
                 else
@@ -157,9 +164,16 @@ namespace OutlookClassifierAddIn5
 
                 ct.ThrowIfCancellationRequested();
                 PaneControl.SetStatus("Building suggestions...");
-                await Queue.BuildQueuesAsync(Application, 90, ct);
+                await Queue.BuildQueuesAsync(Application, new QueueBuildOptions
+                {
+                    DaysBack = 90,
+                    Cap = 500,
+                    IgnoreFlagged = true,
+                    UseIncremental = true,
+                    ForceFolderRefresh = true
+                }, ct);
 
-                if (!ct.IsCancellationRequested && PaneControl != null)
+                if (!ct.IsCancellationRequested && PaneControl != null && version == _activationVersion)
                     PaneControl.RefreshQueues();
 
                 Explorer_SelectionChange();
@@ -172,6 +186,10 @@ namespace OutlookClassifierAddIn5
             {
                 AppLogger.Error(ex, "Pane activation failed.");
                 if (PaneControl != null) PaneControl.SetStatus("Suggestion build failed. See local log.");
+            }
+            finally
+            {
+                _activationGate.Release();
             }
         }
 
@@ -235,6 +253,7 @@ namespace OutlookClassifierAddIn5
             try
             {
                 _queueBuildCts.Cancel();
+                Interlocked.Increment(ref _activationVersion);
                 AppLogger.Info("Queue build cancelled. " + reason);
             }
             catch (Exception ex)

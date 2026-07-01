@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data.SQLite;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -47,16 +48,24 @@ namespace OutlookClassifierAddIn5.Data
 
     public class FeedbackStore
     {
-        private const int CurrentSchemaVersion = 3;
+        private const int CurrentSchemaVersion = 4;
         private const int DefaultBodySnippetLength = 1000;
 
         private readonly string _dbPath;
         private readonly string _connStr;
 
         public FeedbackStore()
+            : this(null)
         {
-            Directory.CreateDirectory(AppLogger.DataDirectory);
-            _dbPath = Path.Combine(AppLogger.DataDirectory, "store.sqlite");
+        }
+
+        public FeedbackStore(string dbPath)
+        {
+            _dbPath = string.IsNullOrWhiteSpace(dbPath)
+                ? Path.Combine(AppLogger.DataDirectory, "store.sqlite")
+                : dbPath;
+            var dir = Path.GetDirectoryName(_dbPath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             _connStr = "Data Source=" + _dbPath + ";Version=3;";
         }
 
@@ -91,6 +100,7 @@ namespace OutlookClassifierAddIn5.Data
                     if (version < 1) Migrate0To1(conn);
                     if (version < 2) Migrate1To2(conn);
                     if (version < 3) Migrate2To3(conn);
+                    if (version < 4) Migrate3To4(conn);
 
                     AppLogger.Info("Database schema ready at version " + CurrentSchemaVersion + ".");
                 }
@@ -234,6 +244,22 @@ CREATE TABLE IF NOT EXISTS FeedbackExamples (
             }
         }
 
+        private static void Migrate3To4(SQLiteConnection conn)
+        {
+            using (var tx = conn.BeginTransaction())
+            {
+                AppLogger.Info("Applying schema migration 3 -> 4.");
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_InternetMessageId ON Emails(InternetMessageId);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_ConversationId ON Emails(ConversationId);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_Emails_NormalizedSubjectHash ON Emails(NormalizedSubjectHash);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_FeedbackExamples_CreatedUtc ON FeedbackExamples(CreatedUtc);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_FeedbackExamples_ReceivedUtc ON FeedbackExamples(ReceivedUtc);", transaction: tx);
+                conn.Execute(@"CREATE INDEX IF NOT EXISTS IX_FeedbackExamples_ConversationId ON FeedbackExamples(ConversationId);", transaction: tx);
+                SetSchemaVersion(conn, tx, 4);
+                tx.Commit();
+            }
+        }
+
         private static void AddColumnIfMissing(SQLiteConnection conn, SQLiteTransaction tx, string table, string column, string definition)
         {
             if (ColumnExists(conn, table, column)) return;
@@ -341,8 +367,9 @@ VALUES
             return rows.Select(ToEmailRow).ToList();
         }
 
-        public async Task<List<TrainingExample>> LoadTrainingExamplesAsync(int? recentDays = 180, bool excludeSystemFolders = true)
+        public async Task<List<TrainingExample>> LoadTrainingExamplesAsync(int? recentDays = 180, bool excludeSystemFolders = true, bool includeBody = true)
         {
+            var sw = Stopwatch.StartNew();
             using (var conn = new SQLiteConnection(_connStr))
             {
                 await conn.OpenAsync();
@@ -351,10 +378,14 @@ VALUES
                     ? DateTime.UtcNow.AddDays(-recentDays.Value).ToString("o")
                     : null;
 
+                var bodySelect = includeBody ? "IFNULL(Body,'') AS Body" : "'' AS Body";
+                var emailSystemFilter = excludeSystemFolders ? (" AND " + SystemFolderSqlPredicate("Folder")) : string.Empty;
+                var feedbackSystemFilter = excludeSystemFolders ? (" AND " + SystemFolderSqlPredicate("ChosenFolder")) : string.Empty;
+
                 var emailSql = @"
 SELECT
   IFNULL(Subject,'') AS Subject,
-  IFNULL(Body,'') AS Body,
+  " + bodySelect + @",
   IFNULL(FromAddress,'') AS FromAddress,
   IFNULL(SenderDomain,'') AS SenderDomain,
   COALESCE(HasAttachments,0) AS HasAttachments,
@@ -363,12 +394,12 @@ SELECT
   'Emails' AS Source
 FROM Emails
 WHERE Folder IS NOT NULL
-  AND (@Cutoff IS NULL OR ReceivedUtc IS NULL OR ReceivedUtc >= @Cutoff);";
+  AND (@Cutoff IS NULL OR ReceivedUtc IS NULL OR ReceivedUtc >= @Cutoff)" + emailSystemFilter + @";";
 
                 var feedbackSql = @"
 SELECT
   IFNULL(Subject,'') AS Subject,
-  IFNULL(Body,'') AS Body,
+  " + bodySelect + @",
   IFNULL(FromAddress,'') AS FromAddress,
   IFNULL(SenderDomain,'') AS SenderDomain,
   COALESCE(HasAttachments,0) AS HasAttachments,
@@ -378,7 +409,7 @@ SELECT
   CreatedUtc AS CreatedUtcText
 FROM FeedbackExamples
 WHERE ChosenFolder IS NOT NULL
-  AND (@Cutoff IS NULL OR ReceivedUtc IS NULL OR ReceivedUtc >= @Cutoff OR CreatedUtc >= @Cutoff);";
+  AND (@Cutoff IS NULL OR ReceivedUtc IS NULL OR ReceivedUtc >= @Cutoff OR CreatedUtc >= @Cutoff)" + feedbackSystemFilter + @";";
 
                 var records = new List<TrainingRecord>();
                 records.AddRange(await conn.QueryAsync<TrainingRecord>(emailSql, new { Cutoff = cutoff }));
@@ -409,9 +440,12 @@ WHERE ChosenFolder IS NOT NULL
                     });
                 }
 
-                return examples
+                var result = examples
                     .OrderByDescending(r => r.ReceivedUtc.HasValue ? r.ReceivedUtc.Value : DateTime.MinValue)
                     .ToList();
+                sw.Stop();
+                AppLogger.Info("Training rows loaded. Rows=" + result.Count + ", includeBody=" + includeBody + ", elapsedMs=" + sw.ElapsedMilliseconds + ".");
+                return result;
             }
         }
 
@@ -434,8 +468,10 @@ WHERE ChosenFolder IS NOT NULL
 
         public Task UpsertEmailsAsync(IEnumerable<ScanService.SeedRow> rows, CancellationToken ct)
         {
+            var materialized = (rows ?? Enumerable.Empty<ScanService.SeedRow>()).ToList();
             return Task.Run(() =>
             {
+                var sw = Stopwatch.StartNew();
                 using (var conn = new SQLiteConnection(_connStr))
                 {
                     conn.Open();
@@ -470,7 +506,7 @@ VALUES
                         AddParameters(update, "@EntryId", "@StoreId", "@InternetMessageId", "@ConversationId", "@NormalizedSubjectHash", "@Folder", "@Subject", "@Body", "@FromAddress", "@SenderDomain", "@HasAttachments", "@ReceivedUtc");
                         AddParameters(insert, "@EntryId", "@StoreId", "@InternetMessageId", "@ConversationId", "@NormalizedSubjectHash", "@Folder", "@Subject", "@Body", "@FromAddress", "@SenderDomain", "@HasAttachments", "@ReceivedUtc");
 
-                        foreach (var r in rows ?? Enumerable.Empty<ScanService.SeedRow>())
+                        foreach (var r in materialized)
                         {
                             ct.ThrowIfCancellationRequested();
 
@@ -499,13 +535,17 @@ VALUES
                         tx.Commit();
                     }
                 }
+                sw.Stop();
+                AppLogger.Info("Email batch upsert complete. Rows=" + materialized.Count + ", elapsedMs=" + sw.ElapsedMilliseconds + ".");
             }, ct);
         }
 
         public Task UpsertBodiesAsync(IEnumerable<ScanService.SeedBody> bodies, CancellationToken ct)
         {
+            var materialized = (bodies ?? Enumerable.Empty<ScanService.SeedBody>()).ToList();
             return Task.Run(() =>
             {
+                var sw = Stopwatch.StartNew();
                 using (var conn = new SQLiteConnection(_connStr))
                 {
                     conn.Open();
@@ -521,7 +561,7 @@ UPDATE Emails
                         var pId = cmd.CreateParameter(); pId.ParameterName = "@EntryId"; cmd.Parameters.Add(pId);
                         var pBody = cmd.CreateParameter(); pBody.ParameterName = "@Body"; cmd.Parameters.Add(pBody);
 
-                        foreach (var b in bodies ?? Enumerable.Empty<ScanService.SeedBody>())
+                        foreach (var b in materialized)
                         {
                             ct.ThrowIfCancellationRequested();
                             pId.Value = b.EntryId ?? string.Empty;
@@ -532,6 +572,8 @@ UPDATE Emails
                         tx.Commit();
                     }
                 }
+                sw.Stop();
+                AppLogger.Info("Body batch upsert complete. Rows=" + materialized.Count + ", elapsedMs=" + sw.ElapsedMilliseconds + ".");
             }, ct);
         }
 
@@ -545,14 +587,17 @@ UPDATE Emails
 
         public Task RecordApprovalsAsync(IEnumerable<FeedbackExample> feedbackExamples, IEnumerable<DecisionRecord> decisions, CancellationToken ct)
         {
+            var feedbackList = (feedbackExamples ?? Enumerable.Empty<FeedbackExample>()).ToList();
+            var decisionList = (decisions ?? Enumerable.Empty<DecisionRecord>()).ToList();
             return Task.Run(() =>
             {
+                var sw = Stopwatch.StartNew();
                 using (var conn = new SQLiteConnection(_connStr))
                 {
                     conn.Open();
                     using (var tx = conn.BeginTransaction())
                     {
-                        foreach (var decision in decisions ?? Enumerable.Empty<DecisionRecord>())
+                        foreach (var decision in decisionList)
                         {
                             ct.ThrowIfCancellationRequested();
                             var chosen = FolderPathNormalizer.Normalize(decision.Chosen);
@@ -590,7 +635,7 @@ VALUES
                             }
                         }
 
-                        foreach (var feedback in feedbackExamples ?? Enumerable.Empty<FeedbackExample>())
+                        foreach (var feedback in feedbackList)
                         {
                             ct.ThrowIfCancellationRequested();
                             InsertFeedbackExample(conn, tx, feedback);
@@ -599,6 +644,8 @@ VALUES
                         tx.Commit();
                     }
                 }
+                sw.Stop();
+                AppLogger.Info("Approval records written. Feedback=" + feedbackList.Count + ", decisions=" + decisionList.Count + ", elapsedMs=" + sw.ElapsedMilliseconds + ".");
             }, ct);
         }
 
@@ -801,6 +848,47 @@ VALUES
                     ReceivedUtc = feedback.ReceivedUtc.HasValue ? feedback.ReceivedUtc.Value.ToUniversalTime().ToString("o") : null,
                     Source = string.IsNullOrWhiteSpace(feedback.Source) ? "Feedback" : feedback.Source
                 }, tx);
+        }
+
+        private static string SystemFolderSqlPredicate(string column)
+        {
+            var normalized = "LOWER(REPLACE(" + column + ", '\\\\', '/'))";
+            return "(" +
+                   normalized + " <> 'inbox' AND " +
+                   normalized + " <> 'sent items' AND " +
+                   normalized + " <> 'sent mail' AND " +
+                   normalized + " <> 'deleted items' AND " +
+                   normalized + " <> 'trash' AND " +
+                   normalized + " <> 'drafts' AND " +
+                   normalized + " <> 'outbox' AND " +
+                   normalized + " <> 'junk' AND " +
+                   normalized + " <> 'junk e-mail' AND " +
+                   normalized + " <> 'junk email' AND " +
+                   normalized + " <> 'spam' AND " +
+                   normalized + " <> 'archive' AND " +
+                   normalized + " <> 'calendar' AND " +
+                   normalized + " <> 'contacts' AND " +
+                   normalized + " <> 'tasks' AND " +
+                   normalized + " <> 'notes' AND " +
+                   normalized + " <> 'journal' AND " +
+                   normalized + " NOT LIKE '%/inbox' AND " +
+                   normalized + " NOT LIKE '%/sent items%' AND " +
+                   normalized + " NOT LIKE '%/sent mail%' AND " +
+                   normalized + " NOT LIKE '%/deleted items%' AND " +
+                   normalized + " NOT LIKE '%/trash%' AND " +
+                   normalized + " NOT LIKE '%/drafts%' AND " +
+                   normalized + " NOT LIKE '%/outbox%' AND " +
+                   normalized + " NOT LIKE '%/junk%' AND " +
+                   normalized + " NOT LIKE '%/junk e-mail%' AND " +
+                   normalized + " NOT LIKE '%/junk email%' AND " +
+                   normalized + " NOT LIKE '%/spam%' AND " +
+                   normalized + " NOT LIKE '%/archive%' AND " +
+                   normalized + " NOT LIKE '%/calendar%' AND " +
+                   normalized + " NOT LIKE '%/contacts%' AND " +
+                   normalized + " NOT LIKE '%/tasks%' AND " +
+                   normalized + " NOT LIKE '%/notes%' AND " +
+                   normalized + " NOT LIKE '%/journal%'" +
+                   ")";
         }
 
         private static void NormalizeStoredFolderPaths(SQLiteConnection conn, SQLiteTransaction tx)
